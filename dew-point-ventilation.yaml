@@ -1,0 +1,479 @@
+##########################################################################################
+#
+# Project Settings
+#
+##########################################################################################
+
+substitutions:
+  name: dew-point-ventilation
+  friendly_name: Taupunktlüftung
+  area: Miscellaneous
+  version: 2.0.0
+
+  # WEMOS D1 Mini
+  #
+  # Pinout: https://randomnerdtutorials.com/esp8266-pinout-reference-gpios/
+  #
+  # PIN/GPIO Settings
+  #
+  # Relais             GPIO02
+  #
+  # DHT22 (in)         GPIO16
+  # DHT22 (out)        GPIO14
+  # 
+  # LCD Display
+  # SCL                GPIO05
+  # SDA                GPIO04
+  #
+  # Rotary Encoder CLK GPIO12
+  # Rotary Encoder DT  GPIO13
+  # Rotary Encoder SW  GPIO0
+
+##########################################################################################
+#
+# General Settings
+#
+##########################################################################################
+
+esphome:
+  name: "${name}"
+  friendly_name: "${friendly_name}"
+  area: "${area}"
+  
+  project:
+    name: "esphome.${name}"
+    version: "${version}"
+
+  on_boot: 
+    then:
+      # set backlicht on/off after x seconds
+      - binary_sensor.template.publish:
+          id: backlight
+          state: ON
+      - binary_sensor.template.publish:
+          id: backlight
+          state: OFF
+
+packages:
+  api: !include common/api.yaml
+  logger: !include common/logger.yaml
+  mqtt: !include common/mqtt.yaml
+  ota: !include common/ota.yaml
+  time: !include common/time.yaml
+  web_server: !include common/web_server.yaml
+  wifi: !include common/wifi.yaml
+
+logger:
+  logs:
+    component: ERROR
+
+##########################################################################################
+#
+# Board Settings
+#
+##########################################################################################
+
+esp8266:
+  board: d1_mini
+
+##########################################################################################
+#
+# Specific Settings
+#
+##########################################################################################
+
+globals:
+  - id: page
+    type: int
+    initial_value: "1"
+
+i2c:
+  sda: GPIO04
+  scl: GPIO05
+  scan: False
+  id: i2c_bus
+  frequency: 400kHz
+
+lcd_menu:
+  id: lcd_display_menu
+  display_id: lcd_display
+  active: False
+  mode: rotary
+  mark_back: 0x01
+  mark_selected: 0x3e
+  mark_editing: 0x2a
+  mark_submenu: 0x7e
+  items:
+    - type: command
+      text: !lambda |-
+        return "Back             \x01";
+      on_value:
+        then:
+          - display_menu.hide:
+    - type: select
+      text: 'Mode'
+      immediate_edit: False
+      select: mode
+    - type: number
+      text: 'Backlight delay'
+      immediate_edit: False
+      number: backlight_delay
+    - type: number
+      text: 'Dew point diff. min.'
+      immediate_edit: False
+      number: dew_point_difference_min
+    - type: number
+      text: 'Hysteresis'
+      immediate_edit: False
+      number: hysteresis
+    - type: number
+      text: 'Indoor temp. min.'
+      immediate_edit: False
+      number: indoor_temperature_min
+    - type: number
+      text: 'Outdoor temp. min.'
+      immediate_edit: False
+      number: outdoor_temperature_min
+    - type: command
+      text: !lambda |-
+        return "Back             \x01";
+      on_value:
+        then:
+          - display_menu.hide:
+
+display:
+  - platform: lcd_pcf8574
+    dimensions: 20x4
+    address: 0x27
+    id: lcd_display
+    update_interval: 250ms
+    user_characters:
+      - position: 0
+        data:
+          # degrees symbol
+          - 0b00110
+          - 0b01001
+          - 0b01001
+          - 0b00110
+          - 0b00000
+          - 0b00000
+          - 0b00000
+          - 0b00000
+      - position: 1
+        data: 
+          # mark back symbol
+          - 0b00100
+          - 0b01000
+          - 0b11110
+          - 0b01001
+          - 0b00101
+          - 0b00001
+          - 0b11110
+          - 0b00000
+    lambda: |-
+      id(lcd_display_menu).draw();
+      if (!id(lcd_display_menu).is_active())
+      {
+        switch (id(page))
+        {
+          case 1:
+            it.print(0, 0, "Indoor:");
+            it.printf(0, 1, "T: %.1f\x08" "C | H: %.1f%%", id(indoor_temperature).state, id(indoor_humidity).state);
+            it.printf(0, 2, "D: %.1f\x08" "C", (!isnan(id(indoor_dew_point).state) ? id(indoor_dew_point).state : 0.0));
+            it.printf(0, 3, "M: %s", id(mode).state.c_str());
+            break;
+
+          case 2:
+            it.print(0, 0, "Outdoor:");
+            it.printf(0, 1, "T: %.1f\x08" "C | H: %.1f%%", id(outdoor_temperature).state, id(outdoor_humidity).state);
+            it.printf(0, 2, "D: %.1f\x08" "C", (!isnan(id(outdoor_dew_point).state) ? id(outdoor_dew_point).state : 0.0));
+            it.printf(0, 3, "M: %s", id(mode).state.c_str());
+            break;
+        }
+      }
+
+text_sensor:
+  - <<: !include common/text_sensor/version.config.yaml
+  - <<: !include common/text_sensor/wifi_info.config.yaml
+
+number:
+  # minimaler Taupunktunterschied, bei dem das Relais schaltet
+  - platform: template
+    name: Minimum dew point difference
+    id: dew_point_difference_min
+    min_value: 0.0
+    max_value: 10.0
+    initial_value: 3.0
+    restore_value: True
+    optimistic: True
+    step: 0.5
+  # Abstand von Ein- und Ausschaltpunkt
+  - platform: template
+    name: Hysteresis
+    id: hysteresis
+    min_value: -1.0
+    max_value: 5.0
+    initial_value: 3.0
+    restore_value: True
+    optimistic: True
+    step: 0.5
+  # Minimale Innentemperatur, bei der die Lüftung aktiviert wird
+  - platform: template
+    name: Indoor temperature minimum
+    id: indoor_temperature_min
+    min_value: -30.0
+    max_value: 30.0
+    initial_value: 10.0
+    restore_value: True
+    optimistic: True
+    step: 0.5
+  # Minimale Außentemperatur, bei der die Lüftung aktiviert wird
+  - platform: template
+    name: Outdoor temperature minimum
+    id: outdoor_temperature_min
+    min_value: -30.0
+    max_value: 30.0
+    initial_value: -30.0
+    restore_value: True
+    optimistic: True
+    step: 0.5
+  # Backlight delay
+  - platform: template
+    name: Backlight delay
+    id: backlight_delay
+    min_value: 0
+    max_value: 90
+    initial_value: 10
+    optimistic: True
+    internal: True
+    step: 1
+
+binary_sensor:
+  - <<: !include common/binary_sensor/connection_status.config.yaml
+
+  - platform: gpio
+    pin: GPIO0
+    name: Menu
+    internal: True
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+    on_press:
+      then:
+        # set backlicht on/off after x seconds
+        - binary_sensor.template.publish:
+            id: backlight
+            state: ON
+        - binary_sensor.template.publish:
+            id: backlight
+            state: OFF
+        # if button is pressed and menu is active send enter state else show menu
+        - if:
+            condition:
+              display_menu.is_active:
+            then:
+              - display_menu.enter:
+            else:
+              - display_menu.show:
+
+  - platform: template
+    id: backlight
+    internal: True
+    filters:
+      - delayed_off: !lambda |-
+          // delayed_off should return milliseconds
+          return id(backlight_delay).state * 1000;
+    on_press:
+      then:
+        - lambda: |-
+            id(lcd_display).backlight();
+    on_release:
+      then:
+        - lambda: |-
+            id(lcd_display).no_backlight();
+
+select:
+  - platform: template
+    name: Mode
+    id: mode
+    icon: mdi:light-switch
+    options:
+      - "Automatic"
+      - "On"
+      - "Off"
+    initial_option: "Automatic"
+    optimistic: True
+    restore_value: False
+    on_value:
+      then:
+        - lambda: |-
+            if (id(mode).state == "Automatic")
+            {
+              if (id(delta_dew_point).state > (id(dew_point_difference_min).state + id(hysteresis).state))
+              {
+                id(relais_fan).turn_on();
+              }
+              else if (id(delta_dew_point).state < id(dew_point_difference_min).state)
+              {
+                id(relais_fan).turn_off();
+              }
+              else if (id(indoor_temperature).state < id(indoor_temperature_min).state)
+              {
+                id(relais_fan).turn_off();
+              }
+              else if (id(outdoor_temperature).state < id(outdoor_temperature_min).state)
+              {
+                id(relais_fan).turn_off();
+              }
+            }
+            else if (id(mode).state == "On")
+            {
+              id(relais_fan).turn_on();
+            }
+            else if (id(mode).state == "Off")
+            {
+              id(relais_fan).turn_off();
+            }
+
+button:
+  - <<: !include common/button/restart.config.yaml
+  - <<: !include common/button/factory_reset.config.yaml
+
+sensor:
+  - <<: !include common/sensor/uptime.config.yaml
+  - <<: !include common/sensor/wifi_signal.config.yaml
+
+  - platform: rotary_encoder
+    name: Rotary Encoder
+    internal: True
+    pin_a: GPIO12
+    pin_b: GPIO13
+    restore_mode: ALWAYS_ZERO
+    filters:
+      debounce: 30ms
+    on_anticlockwise:
+      # set backlicht on/off after x seconds
+      - binary_sensor.template.publish:
+          id: backlight
+          state: ON
+      - binary_sensor.template.publish:
+          id: backlight
+          state: OFF
+      # scroll throught pages if menu not active
+      - if:
+          condition:
+            lambda: 'return !id(lcd_display_menu).is_active();'
+          then:
+            - lambda: |-
+                id(page) = (id(page) + 1);
+                if (id(page) > 2)
+                {
+                  id(page) = 1;
+                }
+          else:
+            - display_menu.up:
+    on_clockwise:
+      # set backlicht on/off after x seconds
+      - binary_sensor.template.publish:
+          id: backlight
+          state: ON
+      - binary_sensor.template.publish:
+          id: backlight
+          state: OFF
+      # scroll throught pages if menu not active
+      - if:
+          condition:
+            lambda: 'return !id(lcd_display_menu).is_active();'
+          then:
+            - lambda: |-
+                id(page) = (id(page) - 1);
+                if (id(page) < 1)
+                {
+                  id(page) = 2;
+                }
+          else:
+            - display_menu.down:
+
+  - platform: template
+    name: Delta Dew Point
+    id: delta_dew_point
+    device_class: temperature
+    unit_of_measurement: °C
+    icon: mdi:thermometer-alert
+    accuracy_decimals: 2
+    lambda: |-
+      return id(indoor_dew_point).state - id(outdoor_dew_point).state;
+
+  #
+  # Outdoor sensors
+  #
+  
+  - platform: dht
+    pin: GPIO16
+    model: DHT22
+    temperature:
+      name: Outdoor Temperature
+      id: outdoor_temperature
+    humidity:
+      name: Outdoor Humidity
+      id: outdoor_humidity
+    update_interval: 15s
+  
+  - platform: template
+    name: Outdoor Dew Point
+    id: outdoor_dew_point
+    device_class: temperature
+    unit_of_measurement: °C
+    icon: mdi:thermometer-alert
+    accuracy_decimals: 2
+    lambda: |-
+      return (243.5 * (log(id(outdoor_humidity).state / 100) + ((17.67 * id(outdoor_temperature).state) / (243.5 + id(outdoor_temperature).state))) / (17.67 - log(id(outdoor_humidity).state / 100) - ((17.67 * id(outdoor_temperature).state) / (243.5 + id(outdoor_temperature).state))));
+
+  - platform: absolute_humidity
+    name: Outdoor Absolute Humidity
+    id: outdoor_absolute_dew_point
+    icon: mdi:water-percent-alert
+    temperature: outdoor_temperature
+    humidity: outdoor_humidity
+    unit_of_measurement: g/m³
+
+  #
+  # Indoor sensors
+  #
+
+  - platform: dht
+    pin: GPIO14
+    model: DHT22
+    temperature:
+      name: Indoor Temperature
+      id: indoor_temperature
+    humidity:
+      name: Indoor Humidity
+      id: indoor_humidity
+    update_interval: 15s
+  
+  - platform: template
+    name: Indoor Dew Point
+    id: indoor_dew_point
+    device_class: temperature
+    unit_of_measurement: °C
+    icon: mdi:thermometer-alert
+    accuracy_decimals: 2
+    lambda: |-
+      return (243.5 * (log(id(indoor_humidity).state / 100) + ((17.67 * id(indoor_temperature).state) / (243.5 + id(indoor_temperature).state))) / (17.67 - log(id(indoor_humidity).state / 100) - ((17.67 * id(indoor_temperature).state) / (243.5 + id(indoor_temperature).state))));
+
+  - platform: absolute_humidity
+    name: Indoor Absolute Humidity
+    id: indoor_absolute_dew_point
+    icon: mdi:water-percent-alert
+    temperature: indoor_temperature
+    humidity: indoor_humidity
+    unit_of_measurement: g/m³
+
+switch:
+  - platform: gpio
+    name: Relais (Fan)
+    id: relais_fan
+    icon: mdi:fan
+    pin: GPIO02
+    internal: True
