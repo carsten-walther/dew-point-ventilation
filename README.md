@@ -18,9 +18,7 @@ The device is configured so that it also works without a WLAN connection or MQTT
 * 1x Relais Breakout board
 * 1x 360° Rotary Encoder with Push-Button
   
-## Input/Outout MQTT/Home Assistant API
-
-- Delta Dew Point 
+## Input/Outout MQTT/Home Assistant API 
 
 ### Outdoors
 
@@ -36,6 +34,7 @@ The device is configured so that it also works without a WLAN connection or MQTT
 
 ### In general
 
+- Delta Dew Point
 - Uptime
 - Wifi signal
 - Connection status
