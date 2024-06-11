@@ -49,6 +49,7 @@ These settings can also be adjusted via the LCD menu.
 - Minimum indoor temperature at which the ventilation is activated
 - Minimum outside temperature at which the ventilation is activated
 - Backlight delay
+- Mode: Automatic, On, Off
 
 ### Buttons/Selects
 
