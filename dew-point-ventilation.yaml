@@ -16,18 +16,18 @@ substitutions:
   #
   # PIN/GPIO Settings
   #
-  # Relais             GPIO02
+  # Relais             GPIO02 (D4)
   #
-  # DHT22 (in)         GPIO16
-  # DHT22 (out)        GPIO14
+  # DHT22 (in)         GPIO16 (D0)
+  # DHT22 (out)        GPIO14 (D5)
   # 
   # LCD Display
-  # SCL                GPIO05
-  # SDA                GPIO04
+  # SCL                GPIO05 (D1)
+  # SDA                GPIO04 (D2)
   #
-  # Rotary Encoder CLK GPIO12
-  # Rotary Encoder DT  GPIO13
-  # Rotary Encoder SW  GPIO0
+  # Rotary Encoder CLK GPIO12 (D6)
+  # Rotary Encoder DT  GPIO13 (D7)
+  # Rotary Encoder SW  GPIO0  (D3)
 
 ##########################################################################################
 #
