@@ -8,7 +8,7 @@ substitutions:
   name: dew-point-ventilation
   friendly_name: Taupunktlüftung
   area: Miscellaneous
-  version: 2.0.0
+  version: 2.0.2
 
   # WEMOS D1 Mini
   #
@@ -146,7 +146,7 @@ display:
     dimensions: 20x4
     address: 0x27
     id: lcd_display
-    update_interval: 250ms
+    update_interval: 125ms
     user_characters:
       - position: 0
         data:
@@ -177,13 +177,26 @@ display:
         switch (id(page))
         {
           case 1:
+            it.printf(0, 0, "I: %.1f\x08" "C|%.1f%%", id(indoor_temperature).state, id(indoor_humidity).state);
+            it.printf(0, 1, "O: %.1f\x08" "C|%.1f%%", id(outdoor_temperature).state, id(outdoor_humidity).state);
+            it.printf(0, 2, "Dew point (I): %.1f\x08" "C", (!isnan(id(indoor_dew_point).state) ? id(indoor_dew_point).state : 0.0));
+            it.printf(0, 3, "Dew point (O): %.1f\x08" "C", (!isnan(id(outdoor_dew_point).state) ? id(outdoor_dew_point).state : 0.0));
+            break;
+
+          case 2:
+            it.printf(0, 0, "Ventilation: %s", id(mode).state.c_str());
+            it.printf(0, 1, "Delta Dp: %.1f\x08" "C", (!isnan(id(delta_dew_point).state) ? id(delta_dew_point).state : 0.0));
+            it.printf(0, 2, "Delta Dp abs.: %.1f\x08" "g/m³", (!isnan(id(absolute_delta_dew_point).state) ? id(absolute_delta_dew_point).state : 0.0));
+            break;
+
+          case 3:
             it.print(0, 0, "Indoor:");
             it.printf(0, 1, "T: %.1f\x08" "C | H: %.1f%%", id(indoor_temperature).state, id(indoor_humidity).state);
             it.printf(0, 2, "D: %.1f\x08" "C", (!isnan(id(indoor_dew_point).state) ? id(indoor_dew_point).state : 0.0));
             it.printf(0, 3, "M: %s", id(mode).state.c_str());
             break;
 
-          case 2:
+          case 4:
             it.print(0, 0, "Outdoor:");
             it.printf(0, 1, "T: %.1f\x08" "C | H: %.1f%%", id(outdoor_temperature).state, id(outdoor_humidity).state);
             it.printf(0, 2, "D: %.1f\x08" "C", (!isnan(id(outdoor_dew_point).state) ? id(outdoor_dew_point).state : 0.0));
@@ -366,7 +379,7 @@ sensor:
           then:
             - lambda: |-
                 id(page) = (id(page) + 1);
-                if (id(page) > 2)
+                if (id(page) > 4)
                 {
                   id(page) = 1;
                 }
@@ -389,7 +402,7 @@ sensor:
                 id(page) = (id(page) - 1);
                 if (id(page) < 1)
                 {
-                  id(page) = 2;
+                  id(page) = 4;
                 }
           else:
             - display_menu.down:
@@ -403,6 +416,16 @@ sensor:
     accuracy_decimals: 2
     lambda: |-
       return id(indoor_dew_point).state - id(outdoor_dew_point).state;
+  
+  - platform: template
+    name: Absolute Delta Dew Point
+    id: absolute_delta_dew_point
+    device_class: temperature
+    unit_of_measurement: g/m³
+    icon: mdi:water-percent-alert
+    accuracy_decimals: 2
+    lambda: |-
+      return id(indoor_absolute_dew_point).state - id(outdoor_absolute_dew_point).state;
 
   #
   # Outdoor sensors
@@ -414,9 +437,13 @@ sensor:
     temperature:
       name: Outdoor Temperature
       id: outdoor_temperature
+      filters:
+        - offset: 0.0
     humidity:
       name: Outdoor Humidity
       id: outdoor_humidity
+      filters:
+        - offset: 0.0
     update_interval: 15s
   
   - platform: template
@@ -447,9 +474,13 @@ sensor:
     temperature:
       name: Indoor Temperature
       id: indoor_temperature
+      filters:
+        - offset: 0.0
     humidity:
       name: Indoor Humidity
       id: indoor_humidity
+      filters:
+        - offset: 0.0
     update_interval: 15s
   
   - platform: template
