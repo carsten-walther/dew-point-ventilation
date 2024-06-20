@@ -4,30 +4,37 @@
 #
 ##########################################################################################
 
+##########################################################################################
+#
+# WEMOS D1 Mini
+#
+# Pinout: https://randomnerdtutorials.com/esp8266-pinout-reference-gpios/
+#
+# PIN/GPIO Settings
+#
+# Actors:
+# Relais             GPIO02 (D4)
+#
+# Sensors:
+# DHT22 (in)         GPIO16 (D0)
+# DHT22 (out)        GPIO14 (D5)
+# 
+# LCD Display:
+# SCL                GPIO05 (D1)
+# SDA                GPIO04 (D2)
+#
+# Inputs:
+# Rotary Encoder CLK GPIO12 (D6)
+# Rotary Encoder DT  GPIO13 (D7)
+# Rotary Encoder SW  GPIO0  (D3)
+#
+##########################################################################################
+
 substitutions:
   name: dew-point-ventilation
   friendly_name: Taupunktlüftung
   area: Miscellaneous
-  version: 2.0.2
-
-  # WEMOS D1 Mini
-  #
-  # Pinout: https://randomnerdtutorials.com/esp8266-pinout-reference-gpios/
-  #
-  # PIN/GPIO Settings
-  #
-  # Relais             GPIO02 (D4)
-  #
-  # DHT22 (in)         GPIO16 (D0)
-  # DHT22 (out)        GPIO14 (D5)
-  # 
-  # LCD Display
-  # SCL                GPIO05 (D1)
-  # SDA                GPIO04 (D2)
-  #
-  # Rotary Encoder CLK GPIO12 (D6)
-  # Rotary Encoder DT  GPIO13 (D7)
-  # Rotary Encoder SW  GPIO0  (D3)
+  version: 2.1.0
 
 ##########################################################################################
 #
@@ -44,15 +51,21 @@ esphome:
     name: "esphome.${name}"
     version: "${version}"
 
-  on_boot: 
+  on_boot:
+    priority: 600
     then:
-      # set backlicht on/off after x seconds
+      - switch.turn_off: relais_fan
       - binary_sensor.template.publish:
           id: backlight
           state: ON
       - binary_sensor.template.publish:
           id: backlight
           state: OFF
+
+  on_shutdown:
+    priority: 700
+    then:
+      - switch.turn_off: relais_fan
 
 packages:
   api: !include common/api.yaml
@@ -177,10 +190,10 @@ display:
         switch (id(page))
         {
           case 1:
-            it.printf(0, 0, "I: %.1f\x08" "C|%.1f%%", id(indoor_temperature).state, id(indoor_humidity).state);
-            it.printf(0, 1, "O: %.1f\x08" "C|%.1f%%", id(outdoor_temperature).state, id(outdoor_humidity).state);
-            it.printf(0, 2, "Dew point (I): %.1f\x08" "C", (!isnan(id(indoor_dew_point).state) ? id(indoor_dew_point).state : 0.0));
-            it.printf(0, 3, "Dew point (O): %.1f\x08" "C", (!isnan(id(outdoor_dew_point).state) ? id(outdoor_dew_point).state : 0.0));
+            it.printf(0, 0, "I:    %.1f\x08" "C|%.1f%%", id(indoor_temperature).state, id(indoor_humidity).state);
+            it.printf(0, 1, "O:    %.1f\x08" "C|%.1f%%", id(outdoor_temperature).state, id(outdoor_humidity).state);
+            it.printf(0, 2, "Dp (I): %.1f\x08" "C", (!isnan(id(indoor_dew_point).state) ? id(indoor_dew_point).state : 0.0));
+            it.printf(0, 3, "Dp (O): %.1f\x08" "C", (!isnan(id(outdoor_dew_point).state) ? id(outdoor_dew_point).state : 0.0));
             break;
 
           case 2:
@@ -210,7 +223,6 @@ text_sensor:
   - <<: !include common/text_sensor/wifi_info.config.yaml
 
 number:
-  # minimaler Taupunktunterschied, bei dem das Relais schaltet
   - platform: template
     name: Minimum dew point difference
     id: dew_point_difference_min
@@ -220,7 +232,7 @@ number:
     restore_value: True
     optimistic: True
     step: 0.5
-  # Abstand von Ein- und Ausschaltpunkt
+
   - platform: template
     name: Hysteresis
     id: hysteresis
@@ -230,7 +242,7 @@ number:
     restore_value: True
     optimistic: True
     step: 0.5
-  # Minimale Innentemperatur, bei der die Lüftung aktiviert wird
+
   - platform: template
     name: Indoor temperature minimum
     id: indoor_temperature_min
@@ -240,7 +252,7 @@ number:
     restore_value: True
     optimistic: True
     step: 0.5
-  # Minimale Außentemperatur, bei der die Lüftung aktiviert wird
+
   - platform: template
     name: Outdoor temperature minimum
     id: outdoor_temperature_min
@@ -250,7 +262,7 @@ number:
     restore_value: True
     optimistic: True
     step: 0.5
-  # Backlight delay
+
   - platform: template
     name: Backlight delay
     id: backlight_delay
@@ -273,14 +285,12 @@ binary_sensor:
       - delayed_off: 30ms
     on_press:
       then:
-        # set backlicht on/off after x seconds
         - binary_sensor.template.publish:
             id: backlight
             state: ON
         - binary_sensor.template.publish:
             id: backlight
             state: OFF
-        # if button is pressed and menu is active send enter state else show menu
         - if:
             condition:
               display_menu.is_active:
@@ -294,7 +304,6 @@ binary_sensor:
     internal: True
     filters:
       - delayed_off: !lambda |-
-          // delayed_off should return milliseconds
           return id(backlight_delay).state * 1000;
     on_press:
       then:
@@ -365,14 +374,12 @@ sensor:
     filters:
       debounce: 30ms
     on_anticlockwise:
-      # set backlicht on/off after x seconds
       - binary_sensor.template.publish:
           id: backlight
           state: ON
       - binary_sensor.template.publish:
           id: backlight
           state: OFF
-      # scroll throught pages if menu not active
       - if:
           condition:
             lambda: 'return !id(lcd_display_menu).is_active();'
@@ -386,14 +393,12 @@ sensor:
           else:
             - display_menu.up:
     on_clockwise:
-      # set backlicht on/off after x seconds
       - binary_sensor.template.publish:
           id: backlight
           state: ON
       - binary_sensor.template.publish:
           id: backlight
           state: OFF
-      # scroll throught pages if menu not active
       - if:
           condition:
             lambda: 'return !id(lcd_display_menu).is_active();'
