@@ -1,323 +1,542 @@
-##########################################################################################
+################################################################################
 #
 # Project Settings
 #
-##########################################################################################
+################################################################################
 
-##########################################################################################
-#
-# WEMOS D1 Mini
-#
-# Pinout: https://randomnerdtutorials.com/esp8266-pinout-reference-gpios/
-#
-# PIN/GPIO Settings
-#
-# Actors:
-# Relais             GPIO02 (D4)
-#
-# Sensors:
-# DHT22 (in)         GPIO16 (D0)
-# DHT22 (out)        GPIO14 (D5)
-# 
-# LCD Display:
-# SCL                GPIO05 (D1)
-# SDA                GPIO04 (D2)
-#
-# Inputs:
-# Rotary Encoder CLK GPIO12 (D6)
-# Rotary Encoder DT  GPIO13 (D7)
-# Rotary Encoder SW  GPIO0  (D3)
-#
-##########################################################################################
+# Pinout: https://randomnerdtutorials.com/esp32-pinout-reference-gpios/
+# Example Menu: https://www.ambientika.eu/cms/wp-content/uploads/Ambientika-Taupunktsteuerung.pdf
 
 substitutions:
+
   name: dew-point-ventilation
   friendly_name: Taupunktlüftung
-  area: Miscellaneous
-  version: 2.1.0
+  comment: Taupunktlüftung zur Steuerung von Abluftventilatoren.
+  area: Keller
+  version: 3.0.1
 
-##########################################################################################
+  #
+  # GPIOs
+  #
+  PIN_DHT22_IN: GPIO16
+  PIN_DHT22_OUT: GPIO17
+  PIN_I2C_SDA: GPIO21
+  PIN_I2C_SCL: GPIO22
+  PIN_RELAIS: GPIO23
+  PIN_ROTARY_ENCODER_CLK: GPIO25
+  PIN_ROTARY_ENCODER_DT: GPIO26
+  PIN_ROTARY_ENCODER_SW: GPIO27
+
+################################################################################
 #
 # General Settings
 #
-##########################################################################################
+################################################################################
 
+#
+# https://esphome.io/components/esphome.html
+#
 esphome:
   name: "${name}"
   friendly_name: "${friendly_name}"
   area: "${area}"
-  
+  comment: "${comment}"
+
   project:
     name: "esphome.${name}"
     version: "${version}"
+    on_update:
+      then:
+        - switch.turn_off: relais_id
 
   on_boot:
-    priority: 600
+    priority: 800
     then:
-      - switch.turn_off: relais_fan
-      - binary_sensor.template.publish:
-          id: backlight
-          state: ON
-      - binary_sensor.template.publish:
-          id: backlight
-          state: OFF
+      - if:
+          condition:
+            binary_sensor.is_off: backlight_id
+          then:
+            - binary_sensor.template.publish:
+                id: backlight_id
+                state: ON
+            - binary_sensor.template.publish:
+                id: backlight_id
+                state: OFF
+      - ds1307.read_time:
+      - switch.turn_off: relais_id
+  on_loop:
+    then:
+      - lambda: |-
+          // check indoor sensor for plausible values
+          if (isnan(id(indoor_humidity_id).state) || isnan(id(indoor_temperature_id).state)) {
+            id(indoor_sensor_error_id) = true;
+          } else {
+            id(indoor_sensor_error_id) = false;
+          }
+
+          // check indoor sensor for plausible values
+          if (isnan(id(outdoor_humidity_id).state) || isnan(id(outdoor_temperature_id).state)) {
+            id(outdoor_sensor_error_id) = true;
+          } else {
+            id(outdoor_sensor_error_id) = false;
+          }
 
   on_shutdown:
     priority: 700
     then:
-      - switch.turn_off: relais_fan
+      - switch.turn_off: relais_id
 
-packages:
-  api: !include common/api.yaml
-  logger: !include common/logger.yaml
-  mqtt: !include common/mqtt.yaml
-  ota: !include common/ota.yaml
-  time: !include common/time.yaml
-  web_server: !include common/web_server.yaml
-  wifi: !include common/wifi.yaml
+#
+# https://esphome.io/components/esp32.html
+#
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
 
+#
+# https://esphome.io/components/wifi.html
+#
+wifi:
+  id: wifi_id
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: .local
+  fast_connect: True
+  power_save_mode: NONE
+  enable_on_boot: True
+  ap:
+    ssid: "${name}"
+    password: !secret wifi_ap_password
+
+#
+# https://esphome.io/components/captive_portal.html
+#
+captive_portal:
+
+#
+# https://esphome.io/components/ota/esphome.html
+#
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    on_state_change:
+      then:
+        - lambda: |-
+            id(ota_state_id) = state;
+            id(page_id) = 100;
+        - component.update: display_id
+    on_progress:
+      then:
+        - lambda: |-
+            id(ota_progress_id) = x;
+            id(display_id)->update();
+            id(page_id) = 100;
+    on_error:
+      then:
+        - switch.turn_off: relais_id
+        - lambda: |-
+            id(ota_state_id) = ota::OTA_ERROR;
+            id(ota_error_id) = x;
+            id(page_id) = 100;
+        - component.update: display_id
+
+#
+# https://esphome.io/components/api
+#
+api:
+  # Enable transport encryption of the API layer.
+  encryption:
+    # The pre-shared key for the encryption.
+    key: !secret api_encryption_key
+  reboot_timeout: 0s
+
+#
+# https://esphome.io/components/mqtt.html
+#
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+
+  reboot_timeout: 0s
+
+#
+# https://esphome.io/components/web_server
+#
+web_server:
+  port: 80
+  version: 3
+  local: True
+  ota: True
+
+#
+# https://esphome.io/components/time
+#
+time:
+  - platform: ds1307
+    id: ds1307_time
+    address: 0x68
+    # repeated synchronization is not necessary unless the external RTC
+    # is much more accurate than the internal clock
+    update_interval: never
+
+  - platform: homeassistant
+    id: homeassistant_time
+    # instead try to synchronize via network repeatedly ...
+    on_time_sync:
+      then:
+        # ... and update the RTC when the synchronization was successful
+        ds1307.write_time:
+          id: ds1307_time
+
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+    # instead try to synchronize via network repeatedly ...
+    on_time_sync:
+      then:
+        # ... and update the RTC when the synchronization was successful
+        ds1307.write_time:
+          id: ds1307_time
+
+#
+# https://esphome.io/components/logger.html
+#
 logger:
-  logs:
-    component: ERROR
+  level: ERROR
 
-##########################################################################################
-#
-# Board Settings
-#
-##########################################################################################
-
-esp8266:
-  board: d1_mini
-
-##########################################################################################
+################################################################################
 #
 # Specific Settings
 #
-##########################################################################################
+################################################################################
 
+#
+# https://esphome.io/components/globals.html
+#
 globals:
-  - id: page
+  - id: page_id
     type: int
-    initial_value: "1"
+    initial_value: '0'
+  - id: ota_state_id
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: ota_progress_id
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: ota_error_id
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: indoor_sensor_error_id
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: outdoor_sensor_error_id
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
+#
+# https://esphome.io/components/i2c.html
+#
 i2c:
-  sda: GPIO04
-  scl: GPIO05
+  id: i2c_id
+  sda: ${PIN_I2C_SDA}
+  scl: ${PIN_I2C_SCL}
+  frequency: 100kHz
   scan: False
-  id: i2c_bus
-  frequency: 400kHz
 
-lcd_menu:
-  id: lcd_display_menu
-  display_id: lcd_display
-  active: False
-  mode: rotary
-  mark_back: 0x01
-  mark_selected: 0x3e
-  mark_editing: 0x2a
-  mark_submenu: 0x7e
-  items:
-    - type: command
-      text: !lambda |-
-        return "Back             \x01";
-      on_value:
-        then:
-          - display_menu.hide:
-    - type: select
-      text: 'Mode'
-      immediate_edit: False
-      select: mode
-    - type: number
-      text: 'Backlight delay'
-      immediate_edit: False
-      number: backlight_delay
-    - type: number
-      text: 'Dew point diff. min.'
-      immediate_edit: False
-      number: dew_point_difference_min
-    - type: number
-      text: 'Hysteresis'
-      immediate_edit: False
-      number: hysteresis
-    - type: number
-      text: 'Indoor temp. min.'
-      immediate_edit: False
-      number: indoor_temperature_min
-    - type: number
-      text: 'Outdoor temp. min.'
-      immediate_edit: False
-      number: outdoor_temperature_min
-    - type: command
-      text: !lambda |-
-        return "Back             \x01";
-      on_value:
-        then:
-          - display_menu.hide:
+################################################################################
+#
+# Numbers
+#
+################################################################################
 
-display:
-  - platform: lcd_pcf8574
-    dimensions: 20x4
-    address: 0x27
-    id: lcd_display
-    update_interval: 125ms
-    user_characters:
-      - position: 0
-        data:
-          # degrees symbol
-          - 0b00110
-          - 0b01001
-          - 0b01001
-          - 0b00110
-          - 0b00000
-          - 0b00000
-          - 0b00000
-          - 0b00000
-      - position: 1
-        data: 
-          # mark back symbol
-          - 0b00100
-          - 0b01000
-          - 0b11110
-          - 0b01001
-          - 0b00101
-          - 0b00001
-          - 0b11110
-          - 0b00000
-    lambda: |-
-      id(lcd_display_menu).draw();
-      if (!id(lcd_display_menu).is_active())
-      {
-        switch (id(page))
-        {
-          case 1:
-            it.printf(0, 0, "I:    %.1f\x08" "C|%.1f%%", id(indoor_temperature).state, id(indoor_humidity).state);
-            it.printf(0, 1, "O:    %.1f\x08" "C|%.1f%%", id(outdoor_temperature).state, id(outdoor_humidity).state);
-            it.printf(0, 2, "Dp (I): %.1f\x08" "C", (!isnan(id(indoor_dew_point).state) ? id(indoor_dew_point).state : 0.0));
-            it.printf(0, 3, "Dp (O): %.1f\x08" "C", (!isnan(id(outdoor_dew_point).state) ? id(outdoor_dew_point).state : 0.0));
-            break;
-
-          case 2:
-            it.printf(0, 0, "Ventilation: %s", id(mode).state.c_str());
-            it.printf(0, 1, "Delta Dp: %.1f\x08" "C", (!isnan(id(delta_dew_point).state) ? id(delta_dew_point).state : 0.0));
-            it.printf(0, 2, "Delta Dp abs.: %.1f\x08" "g/m³", (!isnan(id(absolute_delta_dew_point).state) ? id(absolute_delta_dew_point).state : 0.0));
-            break;
-
-          case 3:
-            it.print(0, 0, "Indoor:");
-            it.printf(0, 1, "T: %.1f\x08" "C | H: %.1f%%", id(indoor_temperature).state, id(indoor_humidity).state);
-            it.printf(0, 2, "D: %.1f\x08" "C", (!isnan(id(indoor_dew_point).state) ? id(indoor_dew_point).state : 0.0));
-            it.printf(0, 3, "M: %s", id(mode).state.c_str());
-            break;
-
-          case 4:
-            it.print(0, 0, "Outdoor:");
-            it.printf(0, 1, "T: %.1f\x08" "C | H: %.1f%%", id(outdoor_temperature).state, id(outdoor_humidity).state);
-            it.printf(0, 2, "D: %.1f\x08" "C", (!isnan(id(outdoor_dew_point).state) ? id(outdoor_dew_point).state : 0.0));
-            it.printf(0, 3, "M: %s", id(mode).state.c_str());
-            break;
-        }
-      }
-
-text_sensor:
-  - <<: !include common/text_sensor/version.config.yaml
-  - <<: !include common/text_sensor/wifi_info.config.yaml
-
+#
+# https://esphome.io/components/number/index.html
+#
 number:
+
+  #
+  # Minimum dew point difference
+  #
   - platform: template
     name: Minimum dew point difference
-    id: dew_point_difference_min
-    min_value: 0.0
-    max_value: 10.0
-    initial_value: 3.0
+    id: dew_point_difference_min_id
+    min_value: 1.0
+    max_value: 9.0
+    initial_value: 5.0
     restore_value: True
     optimistic: True
     step: 0.5
 
+  #
+  # Hysteresis
+  #
   - platform: template
     name: Hysteresis
-    id: hysteresis
-    min_value: -1.0
+    id: hysteresis_id
+    min_value: 0.0
     max_value: 5.0
-    initial_value: 3.0
+    initial_value: 1.0
     restore_value: True
     optimistic: True
     step: 0.5
 
+  #
+  # Indoor temperature minimum
+  #
   - platform: template
     name: Indoor temperature minimum
-    id: indoor_temperature_min
+    id: indoor_temperature_min_id
+    min_value: 5.0
+    max_value: 25.0
+    initial_value: 8.0
+    restore_value: True
+    optimistic: True
+    step: 1.0
+
+  #
+  # Outdoor temperature minimum
+  #
+  - platform: template
+    name: Outdoor temperature minimum
+    id: outdoor_temperature_min_id
     min_value: -30.0
-    max_value: 30.0
+    max_value: 20.0
+    initial_value: 5.0
+    restore_value: True
+    optimistic: True
+    step: 1.0
+
+  #
+  # Backlight delay
+  #
+  - platform: template
+    name: Backlight delay
+    id: backlight_delay_id
+    min_value: 3.0
+    max_value: 180.0
     initial_value: 10.0
     restore_value: True
     optimistic: True
-    step: 0.5
+    internal: True
+    step: 1.0
 
+  #
+  # Day
+  #
+  # Helper for setting Datetime
+  #
   - platform: template
-    name: Outdoor temperature minimum
-    id: outdoor_temperature_min
-    min_value: -30.0
-    max_value: 30.0
-    initial_value: -30.0
-    restore_value: True
-    optimistic: True
-    step: 0.5
-
-  - platform: template
-    name: Backlight delay
-    id: backlight_delay
-    min_value: 0
-    max_value: 90
-    initial_value: 10
+    name: Day
+    id: datetime_day_id
+    min_value: 1
+    max_value: 31
+    initial_value: 1
     optimistic: True
     internal: True
-    step: 1
+    step: 1.0
 
+  #
+  # Month
+  #
+  # Helper for setting Datetime
+  #
+  - platform: template
+    name: Month
+    id: datetime_month_id
+    min_value: 1
+    max_value: 12
+    initial_value: 1
+    optimistic: True
+    internal: True
+    step: 1.0
+
+  #
+  # Year
+  #
+  # Helper for setting Datetime
+  #
+  - platform: template
+    name: Year
+    id: datetime_year_id
+    min_value: 2024
+    max_value: 2100
+    initial_value: 2024
+    optimistic: True
+    internal: True
+    step: 1.0
+
+  #
+  # Hour
+  #
+  # Helper for setting Datetime
+  #
+  - platform: template
+    name: Hour
+    id: datetime_hour_id
+    min_value: 0
+    max_value: 23
+    initial_value: 12
+    optimistic: True
+    internal: True
+    step: 1.0
+
+  #
+  # Minute
+  #
+  # Helper for setting Datetime
+  #
+  - platform: template
+    name: Minute
+    id: datetime_minute_id
+    min_value: 0
+    max_value: 59
+    initial_value: 0
+    optimistic: True
+    internal: True
+    step: 1.0
+
+  #
+  # Second
+  #
+  # Helper for setting Datetime
+  #
+  - platform: template
+    name: Second
+    id: datetime_second_id
+    min_value: 0
+    max_value: 59
+    initial_value: 0
+    optimistic: True
+    internal: True
+    step: 1.0
+
+################################################################################
+#
+# Text Sensors
+#
+################################################################################
+
+#
+# https://esphome.io/components/text_sensor/index.html
+#
+text_sensor:
+
+  #
+  # Version
+  # https://esphome.io/components/text_sensor/version.html
+  #
+  - platform: version
+    name: ESPHome Version
+
+  #
+  # WiFi Information
+  # https://esphome.io/components/text_sensor/wifi_info.html
+  #
+  - platform: wifi_info
+    ssid:
+      name: SSID
+    bssid:
+      name: BSSID
+    ip_address:
+      name: IP Address
+    dns_address:
+      name: DNS Address
+    mac_address:
+      name: MAC Address
+
+################################################################################
+#
+# Binary Sensors
+#
+################################################################################
+
+#
+# https://esphome.io/components/binary_sensor/index.html
+#
 binary_sensor:
-  - <<: !include common/binary_sensor/connection_status.config.yaml
 
+  #
+  # Rotary Encoder Button
+  # https://esphome.io/components/binary_sensor/gpio.html
+  #
   - platform: gpio
-    pin: GPIO0
+    pin: ${PIN_ROTARY_ENCODER_SW}
     name: Menu
     internal: True
     filters:
-      - delayed_on: 30ms
-      - delayed_off: 30ms
+      - delayed_on: 15ms
+      - delayed_off: 15ms
     on_press:
       then:
-        - binary_sensor.template.publish:
-            id: backlight
-            state: ON
-        - binary_sensor.template.publish:
-            id: backlight
-            state: OFF
         - if:
             condition:
-              display_menu.is_active:
+              binary_sensor.is_off: backlight_id
             then:
-              - display_menu.enter:
+              - binary_sensor.template.publish:
+                  id: backlight_id
+                  state: ON
+              - binary_sensor.template.publish:
+                  id: backlight_id
+                  state: OFF
             else:
-              - display_menu.show:
+              - if:
+                  condition:
+                    display_menu.is_active:
+                  then:
+                    - display_menu.enter:
+                  else:
+                    - display_menu.show:
 
+  #
+  # Backlight
+  # https://esphome.io/components/binary_sensor/template.html
+  #
   - platform: template
-    id: backlight
+    id: backlight_id
     internal: True
     filters:
       - delayed_off: !lambda |-
-          return id(backlight_delay).state * 1000;
+          return id(backlight_delay_id).state * 1000;
     on_press:
       then:
         - lambda: |-
-            id(lcd_display).backlight();
+            id(display_id).backlight();
     on_release:
       then:
         - lambda: |-
-            id(lcd_display).no_backlight();
+            if (!id(lcd_menu_id).is_active()) {
+              id(display_id).no_backlight();
+            }
 
+################################################################################
+#
+# Selects
+#
+################################################################################
+
+#
+# https://esphome.io/components/select/index.html
+#
 select:
+
+  #
+  # Mode
+  # https://esphome.io/components/select/template.html
+  #
   - platform: template
     name: Mode
-    id: mode
+    id: mode_id
     icon: mdi:light-switch
     options:
       - "Automatic"
@@ -329,187 +548,722 @@ select:
     on_value:
       then:
         - lambda: |-
-            if (id(mode).state == "Automatic")
-            {
-              if (id(delta_dew_point).state > (id(dew_point_difference_min).state + id(hysteresis).state))
-              {
-                id(relais_fan).turn_on();
+            if (id(mode_id).state == "Automatic") {
+
+              // only switch
+              if (id(indoor_sensor_error_id) != true || id(outdoor_sensor_error_id) != true) {
+
+                // Taupunkt außen < Taupunkt innen -> Lüfter an
+                if (id(outdoor_dew_point_id).state < id(indoor_dew_point_id).state) {
+                  id(relais_id).turn_on();
+                }
+
+                // Taupunkt außen < Taupunkt innen -> Lüfter aus
+                else if (id(outdoor_dew_point_id).state < id(indoor_dew_point_id).state)
+                {
+                  id(relais_id).turn_off();
+                }
+
+                /*
+                // Taupunkt außen < Taupunkt innen
+                // id(outdoor_dew_point_id).state > id(indoor_dew_point_id).state
+                if (id(delta_dew_point_id).state > (id(dew_point_difference_min_id).state + id(hysteresis_id).state))
+                {
+                  id(relais_id).turn_on();
+                }
+                // Taupunkt außen < Taupunkt innen
+                // id(outdoor_dew_point_id).state < id(indoor_dew_point_id).state
+                else if (id(delta_dew_point_id).state < id(dew_point_difference_min_id).state)
+                {
+                  id(relais_id).turn_off();
+                }
+                else if (id(indoor_temperature_id).state < id(indoor_temperature_min_id).state)
+                {
+                  id(relais_id).turn_off();
+                }
+                else if (id(outdoor_temperature_id).state < id(outdoor_temperature_min_id).state)
+                {
+                  id(relais_id).turn_off();
+                }
+                */
               }
-              else if (id(delta_dew_point).state < id(dew_point_difference_min).state)
-              {
-                id(relais_fan).turn_off();
-              }
-              else if (id(indoor_temperature).state < id(indoor_temperature_min).state)
-              {
-                id(relais_fan).turn_off();
-              }
-              else if (id(outdoor_temperature).state < id(outdoor_temperature_min).state)
-              {
-                id(relais_fan).turn_off();
-              }
-            }
-            else if (id(mode).state == "On")
-            {
-              id(relais_fan).turn_on();
-            }
-            else if (id(mode).state == "Off")
-            {
-              id(relais_fan).turn_off();
+
+            } else if (id(mode_id).state == "On") {
+              id(relais_id).turn_on();
+            } else if (id(mode_id).state == "Off") {
+              id(relais_id).turn_off();
             }
 
+################################################################################
+#
+# Buttons
+#
+################################################################################
+
+#
+# https://esphome.io/components/button/index.html
+#
 button:
-  - <<: !include common/button/restart.config.yaml
-  - <<: !include common/button/factory_reset.config.yaml
 
+  #
+  # Restart
+  # https://esphome.io/components/button/restart.html
+  #
+  - platform: restart
+    id: restart_id
+    name: Restart
+    icon: mdi:reload
+
+  #
+  # Factory Reset
+  # https://esphome.io/components/button/factory_reset.html
+  #
+  - platform: factory_reset
+    id: factoryreset_id
+    name: Factory Reset
+    icon: mdi:restart
+
+  #
+  # Save Mode
+  # https://esphome.io/components/button/safe_mode.html
+  #
+  - platform: safe_mode
+    id: safemode_id
+    name: Restart (Safe Mode)
+    icon: mdi:reload
+
+################################################################################
+#
+# Sensors
+#
+################################################################################
+
+#
+# https://esphome.io/components/sensor/index.html
+#
 sensor:
-  - <<: !include common/sensor/uptime.config.yaml
-  - <<: !include common/sensor/wifi_signal.config.yaml
 
+  #
+  # Uptime
+  # https://esphome.io/components/sensor/uptime.html
+  #
+  - platform: uptime
+    type: seconds
+    name: Uptime
+
+  #
+  # WiFi Signal in dB
+  # https://esphome.io/components/sensor/wifi_signal.html
+  #
+  - platform: wifi_signal
+    id: wifi_signal_db
+    name: WiFi Signal dB
+    update_interval: 60s
+
+  #
+  # WiFi Signal in %
+  # https://esphome.io/components/sensor/wifi_signal.html
+  #
+  - platform: copy
+    id: wifi_signal_percent
+    source_id: wifi_signal_db
+    name: WiFi Signal %
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "%"
+    entity_category: "diagnostic"
+    device_class: ""
+
+  #
+  # Rotary Encoder
+  # https://esphome.io/components/sensor/rotary_encoder.html
+  #
   - platform: rotary_encoder
+    id: rotary_encoder_id
     name: Rotary Encoder
     internal: True
-    pin_a: GPIO12
-    pin_b: GPIO13
+    pin_a: ${PIN_ROTARY_ENCODER_CLK}
+    pin_b: ${PIN_ROTARY_ENCODER_DT}
     restore_mode: ALWAYS_ZERO
     filters:
       debounce: 30ms
     on_anticlockwise:
-      - binary_sensor.template.publish:
-          id: backlight
-          state: ON
-      - binary_sensor.template.publish:
-          id: backlight
-          state: OFF
       - if:
           condition:
-            lambda: 'return !id(lcd_display_menu).is_active();'
+            display_menu.is_active:
           then:
-            - lambda: |-
-                id(page) = (id(page) + 1);
-                if (id(page) > 4)
-                {
-                  id(page) = 1;
-                }
-          else:
             - display_menu.up:
+          else:
+            - if:
+                condition:
+                  binary_sensor.is_off: backlight_id
+                then:
+                  - binary_sensor.template.publish:
+                      id: backlight_id
+                      state: ON
+                  - binary_sensor.template.publish:
+                      id: backlight_id
+                      state: OFF
+                else:
+                  - globals.set:
+                      id: page_id
+                      value: !lambda |-
+                        return id(page_id) -= 1;
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(page_id) <= 0;
+                      then:
+                        - globals.set:
+                            id: page_id
+                            value: !lambda |-
+                              return 0;
+#                  - lambda: |-
+#                      id(page_id) = (id(page_id) - 1);
+#                      if (id(page_id) <= 0) {
+#                        id(page_id) = 0;
+#                      }
     on_clockwise:
-      - binary_sensor.template.publish:
-          id: backlight
-          state: ON
-      - binary_sensor.template.publish:
-          id: backlight
-          state: OFF
       - if:
           condition:
-            lambda: 'return !id(lcd_display_menu).is_active();'
+            display_menu.is_active:
           then:
-            - lambda: |-
-                id(page) = (id(page) - 1);
-                if (id(page) < 1)
-                {
-                  id(page) = 4;
-                }
-          else:
             - display_menu.down:
+          else:
+            - if:
+                condition:
+                  binary_sensor.is_off: backlight_id
+                then:
+                  - binary_sensor.template.publish:
+                      id: backlight_id
+                      state: ON
+                  - binary_sensor.template.publish:
+                      id: backlight_id
+                      state: OFF
+                else:
+                  - globals.set:
+                      id: page_id
+                      value: !lambda |-
+                        return id(page_id) += 1;
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(page_id) >= 2;
+                      then:
+                        - globals.set:
+                            id: page_id
+                            value: !lambda |-
+                              return 2;
+#                  - lambda: |-
+#                      id(page_id) = (id(page_id) + 1);
+#                      if (id(page_id) >= 2) {
+#                        id(page_id) = 2;
+#                      }
 
+  #
+  # Delty Dew Point
+  # https://esphome.io/components/sensor/template.html
+  #
   - platform: template
     name: Delta Dew Point
-    id: delta_dew_point
+    id: delta_dew_point_id
     device_class: temperature
     unit_of_measurement: °C
     icon: mdi:thermometer-alert
-    accuracy_decimals: 2
+    accuracy_decimals: 1
+    update_interval: 5s
     lambda: |-
-      return id(indoor_dew_point).state - id(outdoor_dew_point).state;
-  
+      return id(indoor_dew_point_id).state - id(outdoor_dew_point_id).state;
+
+  #
+  # Absolute Delta Dew Point
+  # https://esphome.io/components/sensor/template.html
+  #
   - platform: template
     name: Absolute Delta Dew Point
-    id: absolute_delta_dew_point
+    id: absolute_delta_dew_point_id
     device_class: temperature
     unit_of_measurement: g/m³
     icon: mdi:water-percent-alert
-    accuracy_decimals: 2
+    accuracy_decimals: 1
+    update_interval: 5s
     lambda: |-
-      return id(indoor_absolute_dew_point).state - id(outdoor_absolute_dew_point).state;
+      return id(indoor_absolute_dew_point_id).state - id(outdoor_absolute_dew_point_id).state;
 
   #
-  # Outdoor sensors
+  # Outdoor Temperature
+  # https://esphome.io/components/sensor/dht.html
   #
-  
   - platform: dht
-    pin: GPIO16
+    pin: ${PIN_DHT22_OUT}
     model: DHT22
     temperature:
       name: Outdoor Temperature
-      id: outdoor_temperature
+      id: outdoor_temperature_id
+      accuracy_decimals: 1
       filters:
         - offset: 0.0
     humidity:
       name: Outdoor Humidity
-      id: outdoor_humidity
+      id: outdoor_humidity_id
+      accuracy_decimals: 1
       filters:
         - offset: 0.0
-    update_interval: 15s
-  
+    update_interval: 5s
+
+  #
+  # Outdoor Dew Point
+  # https://esphome.io/components/sensor/template.html
+  #
   - platform: template
     name: Outdoor Dew Point
-    id: outdoor_dew_point
+    id: outdoor_dew_point_id
     device_class: temperature
     unit_of_measurement: °C
     icon: mdi:thermometer-alert
-    accuracy_decimals: 2
+    accuracy_decimals: 1
+    update_interval: 5s
     lambda: |-
-      return (243.5 * (log(id(outdoor_humidity).state / 100) + ((17.67 * id(outdoor_temperature).state) / (243.5 + id(outdoor_temperature).state))) / (17.67 - log(id(outdoor_humidity).state / 100) - ((17.67 * id(outdoor_temperature).state) / (243.5 + id(outdoor_temperature).state))));
+      return (243.5 * (log(id(outdoor_humidity_id).state / 100) + ((17.67 * id(outdoor_temperature_id).state) / (243.5 + id(outdoor_temperature_id).state))) / (17.67 - log(id(outdoor_humidity_id).state / 100) - ((17.67 * id(outdoor_temperature_id).state) / (243.5 + id(outdoor_temperature_id).state))));
 
+  #
+  # Outdoor Absolute Humidity
+  # https://esphome.io/components/sensor/absolute_humidity.html
+  #
   - platform: absolute_humidity
     name: Outdoor Absolute Humidity
-    id: outdoor_absolute_dew_point
+    id: outdoor_absolute_dew_point_id
     icon: mdi:water-percent-alert
-    temperature: outdoor_temperature
-    humidity: outdoor_humidity
+    temperature: outdoor_temperature_id
+    humidity: outdoor_humidity_id
     unit_of_measurement: g/m³
+    accuracy_decimals: 1
 
   #
-  # Indoor sensors
+  # Indoor Temperature
+  # https://esphome.io/components/sensor/dht.html
   #
-
   - platform: dht
-    pin: GPIO14
+    pin: ${PIN_DHT22_IN}
     model: DHT22
     temperature:
       name: Indoor Temperature
-      id: indoor_temperature
+      id: indoor_temperature_id
+      accuracy_decimals: 1
       filters:
         - offset: 0.0
     humidity:
       name: Indoor Humidity
-      id: indoor_humidity
+      id: indoor_humidity_id
+      accuracy_decimals: 1
       filters:
         - offset: 0.0
-    update_interval: 15s
-  
+    update_interval: 5s
+
+  #
+  # Indoor Dew Point
+  # https://esphome.io/components/sensor/template.html
+  #
   - platform: template
     name: Indoor Dew Point
-    id: indoor_dew_point
+    id: indoor_dew_point_id
     device_class: temperature
     unit_of_measurement: °C
     icon: mdi:thermometer-alert
-    accuracy_decimals: 2
+    accuracy_decimals: 1
+    update_interval: 5s
     lambda: |-
-      return (243.5 * (log(id(indoor_humidity).state / 100) + ((17.67 * id(indoor_temperature).state) / (243.5 + id(indoor_temperature).state))) / (17.67 - log(id(indoor_humidity).state / 100) - ((17.67 * id(indoor_temperature).state) / (243.5 + id(indoor_temperature).state))));
+      return (243.5 * (log(id(indoor_humidity_id).state / 100) + ((17.67 * id(indoor_temperature_id).state) / (243.5 + id(indoor_temperature_id).state))) / (17.67 - log(id(indoor_humidity_id).state / 100) - ((17.67 * id(indoor_temperature_id).state) / (243.5 + id(indoor_temperature_id).state))));
 
+  #
+  # Indoor Absolute Humidity
+  # https://esphome.io/components/sensor/absolute_humidity.html
+  #
   - platform: absolute_humidity
     name: Indoor Absolute Humidity
-    id: indoor_absolute_dew_point
+    id: indoor_absolute_dew_point_id
     icon: mdi:water-percent-alert
-    temperature: indoor_temperature
-    humidity: indoor_humidity
+    temperature: indoor_temperature_id
+    humidity: indoor_humidity_id
     unit_of_measurement: g/m³
+    accuracy_decimals: 1
 
+################################################################################
+#
+# Switches
+#
+################################################################################
+
+#
+# https://esphome.io/components/switch/index.html
+#
 switch:
+
+  #
+  # Relais
+  # https://esphome.io/components/switch/gpio.html
+  #
   - platform: gpio
-    name: Relais (Fan)
-    id: relais_fan
+    id: relais_id
+    name: Fan
     icon: mdi:fan
-    pin: GPIO02
+    pin: ${PIN_RELAIS}
     internal: True
+
+  #
+  # WiFi
+  # https://esphome.io/components/switch/template.html
+  #
+  - platform: template
+    id: wifi_state_id
+    name: "WiFi"
+    icon: "mdi:wifi"
+    internal: False
+    optimistic: True
+    #restore_mode: True
+    assumed_state: True
+    lambda: |-
+      if (!id(wifi_id).is_disabled()) {
+        return true;
+      } else {
+        return false;
+      }
+    turn_on_action:
+      then:
+        - wifi.enable:
+    turn_off_action:
+      then:
+        - wifi.disable:
+
+################################################################################
+#
+# LCD
+#
+################################################################################
+
+#
+# https://esphome.io/components/display_menu/lcd_menu.html
+#
+lcd_menu:
+  id: lcd_menu_id
+  display_id: display_id
+  active: False
+  mode: rotary
+  mark_back: 0x08
+  mark_selected: 0x3e
+  mark_editing: 0x2a
+  mark_submenu: 0x7e
+  items:
+
+    #
+    # Mode
+    #
+    - type: select
+      text: 'Mode'
+      immediate_edit: False
+      select: mode_id
+
+    #
+    # Settings
+    #
+    - type: menu
+      text: 'Settings'
+      items:
+        - type: back
+          text: 'Back'
+        - type: number
+          text: 'Dew point diff. min.'
+          immediate_edit: False
+          number: dew_point_difference_min_id
+        - type: number
+          text: 'Hysteresis'
+          immediate_edit: False
+          number: hysteresis_id
+        - type: number
+          text: 'Indoor temp. min.'
+          immediate_edit: False
+          number: indoor_temperature_min_id
+        - type: number
+          text: 'Outdoor temp. min.'
+          immediate_edit: False
+          number: outdoor_temperature_min_id
+        - type: back
+          text: 'Back'
+    #
+    # System
+    #
+    - type: menu
+      text: 'System'
+      items:
+        - type: back
+          text: 'Back'
+#        - type: menu
+#          text: 'Date'
+#          items:
+#            - type: back
+#              text: 'Back'
+#            - type: number
+#              text: 'Day'
+#              immediate_edit: False
+#              number: datetime_day_id
+#            - type: number
+#              text: 'Month'
+#              immediate_edit: False
+#              number: datetime_month_id
+#            - type: number
+#              text: 'Year'
+#              immediate_edit: False
+#              number: datetime_year_id
+#            - type: back
+#              text: 'Back'
+#          on_leave:
+#            then:
+#              - datetime.time.set:
+#                  id: ds1307_time
+#                  time: !lambda |-
+#                    return {
+#                      .second: id(datetime_second_id),
+#                      .minute: id(datetime_minute_id),
+#                      .hour: id(datetime_hour_id),
+#                      .day_of_month: id(datetime_day_id),
+#                      .month: id(datetime_month_id),
+#                      .year: id(datetime_year_id)
+#                    };
+#        - type: menu
+#          text: 'Time'
+#          items:
+#            - type: back
+#              text: 'Back'
+#            - type: number
+#              text: 'Hour'
+#              immediate_edit: False
+#              number: datetime_hour_id
+#            - type: number
+#              text: 'Mnute'
+#              immediate_edit: False
+#              number: datetime_minute_id
+#            - type: number
+#              text: 'Second'
+#              immediate_edit: False
+#              number: datetime_second_id
+#            - type: back
+#              text: 'Back'
+#          on_leave:
+#            then:
+#              - datetime.time.set:
+#                  id: ds1307_time
+#                  time: !lambda |-
+#                    return {
+#                      .second: id(datetime_second_id),
+#                      .minute: id(datetime_minute_id),
+#                      .hour: id(datetime_hour_id),
+#                      .day_of_month: id(datetime_day_id),
+#                      .month: id(datetime_month_id),
+#                      .year: id(datetime_year_id)
+#                    };
+        - type: number
+          text: 'Backlight delay'
+          immediate_edit: False
+          number: backlight_delay_id
+        - type: switch
+          text: 'WiFi'
+          immediate_edit: False
+          switch: wifi_state_id
+        - type: command
+          text: 'Restart'
+          on_value:
+            then:
+              button.press: restart_id
+        - type: command
+          text: 'Factory Reset'
+          on_value:
+            then:
+              button.press: factoryreset_id
+        - type: back
+          text: 'Back'
+
+    #
+    # Exit Menu
+    #
+    - type: command
+      text: !lambda |-
+        return "Exit Menu";
+      on_value:
+        then:
+          - display_menu.hide:
+
+#
+# https://esphome.io/components/display/lcd_display.html
+#
+display:
+  - platform: lcd_pcf8574
+    dimensions: 20x4
+    address: 0x27
+    id: display_id
+    update_interval: 125ms
+    user_characters:
+      - position: 0
+        data:  # mark_back symbol
+          - 0b00100
+          - 0b01000
+          - 0b11110
+          - 0b01001
+          - 0b00101
+          - 0b00001
+          - 0b11110
+          - 0b00000
+      - position: 1
+        data:
+          # degrees symbol
+          - 0b00110
+          - 0b01001
+          - 0b01001
+          - 0b00110
+          - 0b00000
+          - 0b00000
+          - 0b00000
+          - 0b00000
+      - position: 2
+        data:
+          # ^3 symbol
+          - 0b00110
+          - 0b01001
+          - 0b00010
+          - 0b00001
+          - 0b01001
+          - 0b00110
+          - 0b00000
+          - 0b00000
+      - position: 3
+        data:
+          # No Signal Icon
+          - 0b00000
+          - 0b00000
+          - 0b00000
+          - 0b00000
+          - 0b00000
+          - 0b10000
+          - 0b10000
+          - 0b00000
+      - position: 4
+        data:
+          # Signal Icon
+          - 0b00000
+          - 0b00001
+          - 0b00001
+          - 0b00101
+          - 0b00101
+          - 0b10101
+          - 0b10101
+          - 0b00000
+      - position: 5
+        data:
+          # Attention Icon
+          - 0b01111
+          - 0b01111
+          - 0b01111
+          - 0b00110
+          - 0b00110
+          - 0b00000
+          - 0b00110
+          - 0b00110
+    lambda: |-
+      id(lcd_menu_id).draw();
+      if (!id(lcd_menu_id).is_active())
+      {
+        // Clear Display
+        it.clear();
+
+        switch (id(page_id))
+        {
+          // Standby
+          case 0:
+            // Temperatures
+            it.printf(0, 1, "%7.1f\x01" "C", (!isnan(id(indoor_temperature_id).state) ? id(indoor_temperature_id).state : 0.0));
+            it.printf(9, 1, "%7.1f\x01" "C", (!isnan(id(outdoor_temperature_id).state) ? id(outdoor_temperature_id).state : 0.0));
+
+            // Humidities
+            it.printf(0, 2, "%7.1f %%", (!isnan(id(indoor_humidity_id).state) ? id(indoor_humidity_id).state : 0.0));
+            it.printf(9, 2, "%7.1f %%", (!isnan(id(outdoor_humidity_id).state) ? id(outdoor_humidity_id).state : 0.0));
+
+            // Dewpoints
+            it.printf(0, 3, "%7.1f\x01" "C", (!isnan(id(indoor_dew_point_id).state) ? id(indoor_dew_point_id).state : 0.0));
+            it.printf(9, 3, "%7.1f\x01" "C", (!isnan(id(outdoor_dew_point_id).state) ? id(outdoor_dew_point_id).state : 0.0));
+            break;
+
+          // WiFi Info
+          case 1:
+            if (id(wifi_id).is_disabled()) {
+              it.print(0, 2, "    WiFi disabled");
+            } else {
+              if (id(wifi_id).is_connected()) {
+                it.printf(0, 1, "IP: %16s%", WiFi.localIP().toString().c_str());
+                it.printf(0, 2, "Signal: %11.1f%%", id(wifi_signal_percent).state);
+              } else {
+                it.print(0, 2, "   WiFi connecting");
+              }
+            }
+            break;
+
+          // Sensor missing
+          case 2:
+            if(!id(outdoor_sensor_error_id) && !id(indoor_sensor_error_id)) {
+              it.print(0, 2, "   System is fine!");
+            } else {
+              it.printf(0, 1, "Error:");
+              if (id(indoor_sensor_error_id) == true) {
+                it.print(0, 2, "- Sensor indoor");
+              }
+              if (id(outdoor_sensor_error_id) == true) {
+                if (id(indoor_sensor_error_id) == true) {
+                  it.print(0, 3, "- Sensor outdoor");
+                } else {
+                  it.print(0, 2, "- Sensor outdoor");
+                }
+              }
+            }
+            break;
+
+          // OTA
+          case 100:
+            // Backlight On
+            it.backlight();
+
+            // Show OTA Update
+            switch (id(ota_state_id)) {
+              case ota::OTA_STARTED:
+                it.printf(0, 3, "OTA starting...");
+                break;
+              case ota::OTA_IN_PROGRESS:
+                it.printf(0, 3, "OTA progress:%6.1f%%", id(ota_progress_id));
+                break;
+              case ota::OTA_COMPLETED:
+                it.printf(0, 3, "OTA completed...");
+                break;
+              case ota::OTA_ERROR:
+                it.printf(0, 3, "OTA error: %d", id(ota_error_id));
+                break;
+            }
+            break;
+        }
+
+        // Show Time
+        if (id(ds1307_time).now().is_valid()) {
+          it.strftime(0, 0, "%H:%M", id(ds1307_time).now());
+        } else if (id(homeassistant_time).now().is_valid()) {
+          it.strftime(0, 0, "%H:%M", id(homeassistant_time).now());
+        } else if (id(sntp_time).now().is_valid()) {
+          it.strftime(0, 0, "%H:%M", id(sntp_time).now());
+        } else {
+          it.print(0, 0, "--:--");
+        }
+
+        // show error icon
+        it.printf(13, 0, "%s%", (id(ota_state_id) == ota::OTA_ERROR || id(indoor_sensor_error_id) || id(outdoor_sensor_error_id)) ? "\x05" : "");
+
+        // FAN State
+        it.printf(15, 0, "%3s%", id(relais_id).state ? "ON" : "OFF");
+
+        // WiFi Connection State
+        it.printf(19, 0, "%s", id(wifi_id).is_connected() ? "\x04" : "\x03");
+      }
