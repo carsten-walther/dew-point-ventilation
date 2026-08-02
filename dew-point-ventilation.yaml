@@ -9,17 +9,21 @@
 
 substitutions:
 
-  name: dew-point-ventilation
+  project_name: dew-point-ventilation
+  author_name: carsten-walther
   friendly_name: Taupunktlüftung
-  comment: Taupunktlüftung zur Steuerung von Abluftventilatoren.
+  comment: Taupunktlüftung zur Steuerung von Abluftventilatoren
+  version: 2026.8.2
   area: Keller
-  version: 3.0.1
 
   #
   # GPIOs
   #
+  # obsolete if sht3xd
   PIN_DHT22_IN: GPIO16
+  # obsolete if sht3xd
   PIN_DHT22_OUT: GPIO17
+  
   PIN_I2C_SDA: GPIO21
   PIN_I2C_SCL: GPIO22
   PIN_RELAIS: GPIO23
@@ -34,24 +38,33 @@ substitutions:
 ################################################################################
 
 #
-# https://esphome.io/components/esphome.html
+# https://esphome.io/components/esphome
 #
 esphome:
-  name: "${name}"
+  name: "${project_name}"
   friendly_name: "${friendly_name}"
-  area: "${area}"
   comment: "${comment}"
+  area: "${area}"
 
+  build_path: "../config/esphome/build/${project_name}"
+  
   project:
-    name: "esphome.${name}"
+    name: "${author_name}.${project_name}"
     version: "${version}"
+    # never leave the fan energised across a firmware update
     on_update:
       then:
         - switch.turn_off: relais_id
 
+  # priority 800 runs after hardware init but before WiFi/network comes up
   on_boot:
     priority: 800
     then:
+      # Light the display for backlight_delay seconds so the user sees the
+      # device boot. The ON/OFF pair is deliberate: ON switches the backlight
+      # on immediately, the following OFF is held back by the delayed_off
+      # filter on backlight_id and only lands once the delay has elapsed.
+      # This "pulse" idiom is reused on every user interaction below.
       - if:
           condition:
             binary_sensor.is_off: backlight_id
@@ -62,40 +75,42 @@ esphome:
             - binary_sensor.template.publish:
                 id: backlight_id
                 state: OFF
+      # seed the system clock from the RTC; without network this is the only
+      # source of time, and the display shows --:-- until it succeeds
       - ds1307.read_time:
+      # the relais has no restore_mode, so start from a defined off state
       - switch.turn_off: relais_id
-  on_loop:
-    then:
-      - lambda: |-
-          // check indoor sensor for plausible values
-          if (isnan(id(indoor_humidity_id).state) || isnan(id(indoor_temperature_id).state)) {
-            id(indoor_sensor_error_id) = true;
-          } else {
-            id(indoor_sensor_error_id) = false;
-          }
 
-          // check indoor sensor for plausible values
-          if (isnan(id(outdoor_humidity_id).state) || isnan(id(outdoor_temperature_id).state)) {
-            id(outdoor_sensor_error_id) = true;
-          } else {
-            id(outdoor_sensor_error_id) = false;
-          }
-
+  # priority 700 runs early enough that the relais is still controllable
   on_shutdown:
     priority: 700
     then:
       - switch.turn_off: relais_id
 
 #
-# https://esphome.io/components/esp32.html
+# https://esphome.io/components/esp32
 #
 esp32:
   board: esp32dev
   framework:
-    type: arduino
+    # esp-idf, not arduino: with the arduino framework the libsodium stub that
+    # arduino-esp32 pulls in shadows esphome/libsodium, which breaks the
+    # noise-c build required by "api: encryption" (ESPHome 2026.7.x).
+    # Consequence: no Arduino-only APIs (String, WiFi.*) in any lambda here.
+    type: esp-idf
+    advanced:
+      # Both of these are suggested by ESPHome itself on every boot of this
+      # device (app:171 and app:198). The chip reports rev 3.1, so the workaround
+      # code for older silicon is dead weight, and this bootloader can map SRAM1
+      # as IRAM. Only valid because this is a plain ESP32 - sram1_as_iram is
+      # rejected on other variants.
+      # Raising minimum_chip_revision means the image refuses to boot on a chip
+      # older than 3.1. Fine here, but remember it if the board is ever swapped.
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: True
 
 #
-# https://esphome.io/components/wifi.html
+# https://esphome.io/components/wifi
 #
 wifi:
   id: wifi_id
@@ -106,18 +121,55 @@ wifi:
   power_save_mode: NONE
   enable_on_boot: True
   ap:
-    ssid: "${name}"
+    ssid: "${project_name}"
     password: !secret wifi_ap_password
 
 #
-# https://esphome.io/components/captive_portal.html
+# https://esphome.io/components/captive_portal
 #
 captive_portal:
 
 #
-# https://esphome.io/components/ota/esphome.html
+# https://esphome.io/components/http_request
+#
+http_request:
+  verify_ssl: false
+
+#
+# Two OTA paths are configured: http_request pulls a build from the web server
+# (triggered by the "Firmware Update" button), esphome is the classic push from
+# the dashboard. Both share the same handlers, which park the display on
+# page 100 so the user sees progress on the LCD instead of a frozen screen.
 #
 ota:
+  #
+  # https://esphome.io/components/ota/http_request
+  #
+  - platform: http_request
+    on_state_change:
+      then:
+        - lambda: |-
+            id(ota_state_id) = state;
+            id(page_id) = 100;
+        - component.update: display_id
+    on_progress:
+      then:
+        - lambda: |-
+            id(ota_progress_id) = x;
+            id(display_id)->update();
+            id(page_id) = 100;
+    on_error:
+      then:
+        - switch.turn_off: relais_id
+        - lambda: |-
+            id(ota_state_id) = ota::OTA_ERROR;
+            id(ota_error_id) = x;
+            id(page_id) = 100;
+        - component.update: display_id
+
+  #
+  # https://esphome.io/components/ota/esphome
+  #
   - platform: esphome
     password: !secret ota_password
     on_state_change:
@@ -141,6 +193,7 @@ ota:
             id(page_id) = 100;
         - component.update: display_id
 
+
 #
 # https://esphome.io/components/api
 #
@@ -149,17 +202,55 @@ api:
   encryption:
     # The pre-shared key for the encryption.
     key: !secret api_encryption_key
+  # 0s disables the automatic reboot when Home Assistant is unreachable: this
+  # device regulates on its own and must not restart just because HA is down
   reboot_timeout: 0s
 
 #
-# https://esphome.io/components/mqtt.html
+# https://esphome.io/components/mqtt
 #
 mqtt:
+  id: mqtt_client_id
   broker: !secret mqtt_broker
   username: !secret mqtt_username
   password: !secret mqtt_password
-
+  # same reasoning as for the api above
   reboot_timeout: 0s
+  # Off at boot. The off-site broker sends a TCP RST every few minutes and the
+  # reconnect blocks loopTask long enough for the task watchdog to reboot the
+  # device (see the measurements below). Everything the device needs to regulate
+  # works without mqtt, so it stays off until the user asks for it via the
+  # "MQTT" entry in the LCD menu (switch mqtt_state_id).
+  enable_on_boot: False
+  # MEASURED 2026-08-02: with discovery on, this device task-watchdog reset
+  # every 2.5-5 minutes. Disabling mqtt entirely gave 50+ minutes clean, which
+  # pinned the cause here. The broker is off-site and the link drops constantly
+  # ("No PING_RESP", "TCP disconnected"), and ESPHome republishes the discovery
+  # payload for all ~50 entities on every reconnect. Those bursts blocked
+  # loopTask for 1.2-1.5s at a time (api was seen at 2163ms) until the 5s task
+  # watchdog fired - loopTask starved while both CPUs sat in IDLE.
+  # Discovery messages are retained, so entities already known to Home Assistant
+  # survive this being off. Turn it back on briefly if you ever add entities.
+  discovery: False
+  # Default is 15s, which is too tight for this off-site broker: the PINGRESP
+  # regularly missed the window ("No PING_RESP"), each miss dropping the link.
+  # The reconnect is what kills the device - ESPHome tears the client down from
+  # loopTask, and while the mqtt task is stuck in a socket operation over the
+  # bad WAN link that call blocks. Measured signature: the loop goes silent
+  # mid-interval (the 5s DHT poll simply stops) with no mqtt log line before it,
+  # then the 5s task watchdog fires. Stretching the window cuts the disconnect
+  # rate and with it the teardown storm.
+  # NOT a cure, and measured as such: mean time between resets went from ~5min
+  # to 18min26s, then the watchdog fired again. The trigger is logged plainly -
+  # "tcp_read error, errno=Connection reset by peer" (socket errno 104) from the
+  # broker, then ~90s of reconnect attempts, then the watchdog. The broker is
+  # actively closing the connection; this is not packet loss.
+  # Worth checking broker-side: a duplicate client_id makes a broker kick the
+  # older session exactly like this. ESPHome defaults client_id to the device
+  # name - see CONF_CLIENT_ID if another client might be using the same one.
+  # (Delaying the mqtt start via enable_on_boot was tried and did NOT help -
+  # the reset came ~1 minute after mqtt connected, wherever that fell.)
+  keepalive: 60s
 
 #
 # https://esphome.io/components/web_server
@@ -168,7 +259,6 @@ web_server:
   port: 80
   version: 3
   local: True
-  ota: True
 
 #
 # https://esphome.io/components/time
@@ -177,18 +267,12 @@ time:
   - platform: ds1307
     id: ds1307_time
     address: 0x68
+    # must match the sntp timezone: both share one global tz, and the manual
+    # date/time entry below converts local fields to an epoch through it
+    timezone: Europe/Berlin
     # repeated synchronization is not necessary unless the external RTC
     # is much more accurate than the internal clock
     update_interval: never
-
-  - platform: homeassistant
-    id: homeassistant_time
-    # instead try to synchronize via network repeatedly ...
-    on_time_sync:
-      then:
-        # ... and update the RTC when the synchronization was successful
-        ds1307.write_time:
-          id: ds1307_time
 
   - platform: sntp
     id: sntp_time
@@ -205,7 +289,7 @@ time:
           id: ds1307_time
 
 #
-# https://esphome.io/components/logger.html
+# https://esphome.io/components/logger
 #
 logger:
   level: ERROR
@@ -217,12 +301,19 @@ logger:
 ################################################################################
 
 #
-# https://esphome.io/components/globals.html
+# https://esphome.io/components/globals
 #
 globals:
+  # Currently displayed page, selected with the rotary encoder:
+  #   0 = measurements, 1 = WiFi info, 2 = sensor errors, 100 = OTA progress.
+  # 100 is set by the OTA handlers and is outside the 0..2 range the encoder
+  # scrolls through, so it can only be reached automatically, not by turning.
   - id: page_id
     type: int
     initial_value: '0'
+
+  # ota::OTAState of the running update; -1 means "no OTA seen since boot",
+  # which is outside the enum and therefore renders nothing on page 100
   - id: ota_state_id
     type: int
     restore_value: no
@@ -235,6 +326,9 @@ globals:
     type: int
     restore_value: no
     initial_value: '0'
+
+  # Set by the interval below when a DHT reports NaN. Read by control_script
+  # (which then refuses to regulate) and by the display (error icon, page 2).
   - id: indoor_sensor_error_id
     type: bool
     restore_value: no
@@ -245,14 +339,176 @@ globals:
     initial_value: 'false'
 
 #
-# https://esphome.io/components/i2c.html
+# https://esphome.io/components/i2c
+#
+#
+# Shared bus for the LCD (PCF8574 @ 0x27) and the RTC (DS1307 @ 0x68).
+# 100 kHz is the DS1307 maximum, so the bus cannot be clocked faster.
 #
 i2c:
   id: i2c_id
   sda: ${PIN_I2C_SDA}
   scl: ${PIN_I2C_SCL}
   frequency: 100kHz
+  # Maps to scl_wait_us, i.e. the clock-stretching timeout - NOT the transfer
+  # timeout, which esphome hardcodes to 100ms in
+  # i2c_bus_esp_idf.cpp: i2c_master_execute_defined_operations(..., 100).
+  # Neither the PCF8574 nor the DS1307 stretches the clock, so any bounded value
+  # is functionally safe here; 5ms makes a bus that holds SCL low abort quickly
+  # instead of running into the full 100ms with loopTask blocked.
+  # MEASURED: this does NOT stop the watchdog resets. Tried 2026-08-02, reset
+  # came 5 minutes after boot with the unchanged signature (loopTask starved
+  # while both CPUs sit in IDLE). So the hang is not clock stretching. Kept only
+  # because bounding scl_wait_us is sound on its own; do not expect a fix here.
+  timeout: 5ms
   scan: False
+
+#
+# https://esphome.io/components/script
+#
+script:
+
+  #
+  # Ventilation control
+  #
+  # Single source of truth for the relais state. Called periodically by the
+  # interval below and whenever the mode is changed.
+  #
+  - id: control_script
+    mode: restart
+    then:
+      - lambda: |-
+          // manual override
+          const auto mode = id(mode_id).current_option();
+          if (mode == "On") {
+            id(relais_id).turn_on();
+            return;
+          }
+          if (mode == "Off") {
+            id(relais_id).turn_off();
+            return;
+          }
+
+          // automatic mode: never regulate on implausible sensor values
+          if (id(indoor_sensor_error_id) || id(outdoor_sensor_error_id)) {
+            id(relais_id).turn_off();
+            return;
+          }
+
+          // safety limits take precedence over the dew point difference
+          if (id(indoor_temperature_id).state < id(indoor_temperature_min_id).state ||
+              id(outdoor_temperature_id).state < id(outdoor_temperature_min_id).state) {
+            id(relais_id).turn_off();
+            return;
+          }
+
+          const float delta = id(indoor_dew_point_id).state - id(outdoor_dew_point_id).state;
+          const float minimum = id(dew_point_difference_min_id).state;
+
+          // dew point outside sufficiently lower than inside -> ventilate
+          if (delta > minimum + id(hysteresis_id).state) {
+            id(relais_id).turn_on();
+          }
+          // difference collapsed -> stop
+          else if (delta < minimum) {
+            id(relais_id).turn_off();
+          }
+          // in between: keep the current state (that is the hysteresis)
+
+  #
+  # Load the RTC into the datetime helper numbers
+  #
+  # Called when entering the Date/Time menus so that editing starts from the
+  # current time instead of the numbers' initial values.
+  #
+  - id: datetime_load_script
+    mode: single
+    then:
+      - lambda: |-
+          auto now = id(ds1307_time).now();
+          if (!now.is_valid()) {
+            return;
+          }
+          id(datetime_second_id).publish_state(now.second);
+          id(datetime_minute_id).publish_state(now.minute);
+          id(datetime_hour_id).publish_state(now.hour);
+          id(datetime_day_id).publish_state(now.day_of_month);
+          id(datetime_month_id).publish_state(now.month);
+          id(datetime_year_id).publish_state(now.year);
+
+  #
+  # Apply the datetime helper numbers to the system clock and the RTC
+  #
+  # Called when leaving the Date/Time menus.
+  #
+  - id: datetime_apply_script
+    mode: single
+    then:
+      - lambda: |-
+          ESPTime t{};
+          t.second = (uint8_t) id(datetime_second_id).state;
+          t.minute = (uint8_t) id(datetime_minute_id).state;
+          t.hour = (uint8_t) id(datetime_hour_id).state;
+          t.day_of_month = (uint8_t) id(datetime_day_id).state;
+          t.month = (uint8_t) id(datetime_month_id).state;
+          t.year = (uint16_t) id(datetime_year_id).state;
+
+          // day_of_week and day_of_year are unknown when building from fields,
+          // so exclude them from the range check
+          if (!t.fields_in_range(false, false)) {
+            ESP_LOGE("datetime", "Refusing to set invalid date/time");
+            return;
+          }
+
+          // the helper numbers hold local time; this folds in tz and DST
+          t.recalc_timestamp_local();
+          if (t.timestamp == -1) {
+            ESP_LOGE("datetime", "Could not convert local time to epoch");
+            return;
+          }
+
+          // set the system clock first, then let the RTC copy it
+          struct timeval tv = {};
+          tv.tv_sec = t.timestamp;
+          settimeofday(&tv, nullptr);
+
+          id(ds1307_time).write_time();
+
+#
+# https://esphome.io/components/interval
+#
+interval:
+  # 10s is a good match for the 5s DHT update interval: fast enough for the
+  # error icon on the display, cheap enough to not run on every main loop pass
+  - interval: 10s
+    then:
+      - lambda: |-
+          // isnan() alone is not enough: a dead DHT22 humidity element still
+          // answers with a valid checksum, it just reports a frozen value. This
+          // device ran with a constant 1.0% at plausible temperatures, which the
+          // old check waved through - the resulting dew point of -32 C would
+          // have kept the fan off forever without ever raising the error icon.
+          // The datasheet range (0..100%) cannot catch that; only a bound that
+          // comes from the room can.
+          const float indoor_h = id(indoor_humidity_id).state;
+          const float indoor_t = id(indoor_temperature_id).state;
+          id(indoor_sensor_error_id) = isnan(indoor_h) || isnan(indoor_t) ||
+                                       indoor_h < 5.0f ||
+                                       // NOTE: a damp cellar genuinely reaches
+                                       // 95..100% RH - exactly the situation
+                                       // this device exists for. Raise or drop
+                                       // this bound if it ever faults a correct
+                                       // reading.
+                                       indoor_h > 99.5f;
+
+          // Outdoor deliberately gets the lower bound only: outdoor air really
+          // does sit at 100% RH in fog or rain, so an upper bound would fault
+          // the sensor precisely when it is right.
+          const float outdoor_h = id(outdoor_humidity_id).state;
+          const float outdoor_t = id(outdoor_temperature_id).state;
+          id(outdoor_sensor_error_id) = isnan(outdoor_h) || isnan(outdoor_t) ||
+                                        outdoor_h < 5.0f;
+      - script.execute: control_script
 
 ################################################################################
 #
@@ -261,7 +517,7 @@ i2c:
 ################################################################################
 
 #
-# https://esphome.io/components/number/index.html
+# https://esphome.io/components/number/index
 #
 number:
 
@@ -283,6 +539,7 @@ number:
   #
   - platform: template
     name: Hysteresis
+    icon: mdi:chart-bell-curve-cumulative
     id: hysteresis_id
     min_value: 0.0
     max_value: 5.0
@@ -296,6 +553,7 @@ number:
   #
   - platform: template
     name: Indoor temperature minimum
+    icon: mdi:thermometer-low
     id: indoor_temperature_min_id
     min_value: 5.0
     max_value: 25.0
@@ -309,6 +567,7 @@ number:
   #
   - platform: template
     name: Outdoor temperature minimum
+    icon: mdi:thermometer-low
     id: outdoor_temperature_min_id
     min_value: -30.0
     max_value: 20.0
@@ -332,9 +591,19 @@ number:
     step: 1.0
 
   #
-  # Day
+  # Datetime helpers
   #
-  # Helper for setting Datetime
+  # The LCD menu can only edit numbers, so the clock is split into six of them.
+  # They are internal scratch values, not settings: datetime_load_script fills
+  # them from the RTC when the Date/Time menu is entered and
+  # datetime_apply_script writes them back on leaving. Hence no restore_value --
+  # the initial_values below are never seen in practice.
+  # The ranges are per-field only; an impossible date such as 31 February is
+  # rejected by datetime_apply_script, not here.
+  #
+
+  #
+  # Day
   #
   - platform: template
     name: Day
@@ -348,9 +617,6 @@ number:
 
   #
   # Month
-  #
-  # Helper for setting Datetime
-  #
   - platform: template
     name: Month
     id: datetime_month_id
@@ -363,9 +629,6 @@ number:
 
   #
   # Year
-  #
-  # Helper for setting Datetime
-  #
   - platform: template
     name: Year
     id: datetime_year_id
@@ -378,9 +641,6 @@ number:
 
   #
   # Hour
-  #
-  # Helper for setting Datetime
-  #
   - platform: template
     name: Hour
     id: datetime_hour_id
@@ -393,9 +653,6 @@ number:
 
   #
   # Minute
-  #
-  # Helper for setting Datetime
-  #
   - platform: template
     name: Minute
     id: datetime_minute_id
@@ -408,9 +665,6 @@ number:
 
   #
   # Second
-  #
-  # Helper for setting Datetime
-  #
   - platform: template
     name: Second
     id: datetime_second_id
@@ -428,32 +682,80 @@ number:
 ################################################################################
 
 #
-# https://esphome.io/components/text_sensor/index.html
+# https://esphome.io/components/text_sensor/index
 #
 text_sensor:
 
   #
-  # Version
-  # https://esphome.io/components/text_sensor/version.html
+  # ESPHome Version
+  # https://esphome.io/components/text_sensor/version
   #
   - platform: version
     name: ESPHome Version
+    icon: mdi:new-box
+
+  #
+  # Firmware Version
+  #
+  - platform: template
+    name: Firmware Version
+    icon: mdi:new-box
+    update_interval: 60s
+    lambda: |-
+      return {"$version"};
+
+  #
+  # Device Uptime
+  #
+  - platform: template
+    name: Device Uptime
+    icon: mdi:clock-start
+    entity_category: diagnostic
+    device_class: ""
+    lambda: |-
+          int seconds = (id(uptime_seconds_id).state);
+          int days = seconds / (24 * 3600);
+
+          seconds = seconds % (24 * 3600);
+
+          int hours = seconds / 3600;
+          seconds = seconds % 3600;
+
+          int minutes = seconds /  60;
+          seconds = seconds % 60;
+
+          // an implausibly large uptime means the sensor has no reading yet
+          if (days > 3650) {
+            return {"Starting up"};
+          }
+
+          char buf[32];
+          if (days) {
+            snprintf(buf, sizeof(buf), "%dd %dh %dm %ds", days, hours, minutes, seconds);
+          } else if (hours) {
+            snprintf(buf, sizeof(buf), "%dh %dm %ds", hours, minutes, seconds);
+          } else if (minutes) {
+            snprintf(buf, sizeof(buf), "%dm %ds", minutes, seconds);
+          } else {
+            snprintf(buf, sizeof(buf), "%ds", seconds);
+          }
+          return {buf};
 
   #
   # WiFi Information
-  # https://esphome.io/components/text_sensor/wifi_info.html
+  # https://esphome.io/components/text_sensor/wifi_info
   #
   - platform: wifi_info
     ssid:
       name: SSID
-    bssid:
-      name: BSSID
+      icon: mdi:wifi-star
     ip_address:
+      id: ip_address_id
       name: IP Address
+      icon: mdi:ip-network-outline
     dns_address:
       name: DNS Address
-    mac_address:
-      name: MAC Address
+      icon: mdi:dns-outline
 
 ################################################################################
 #
@@ -462,21 +764,29 @@ text_sensor:
 ################################################################################
 
 #
-# https://esphome.io/components/binary_sensor/index.html
+# https://esphome.io/components/binary_sensor/index
 #
 binary_sensor:
 
   #
   # Rotary Encoder Button
-  # https://esphome.io/components/binary_sensor/gpio.html
+  # https://esphome.io/components/binary_sensor/gpio
   #
   - platform: gpio
-    pin: ${PIN_ROTARY_ENCODER_SW}
+    # the KY-040 breakout only pulls up CLK and DT, not SW
+    pin:
+      number: ${PIN_ROTARY_ENCODER_SW}
+      mode: INPUT_PULLUP
+      inverted: True
     name: Menu
     internal: True
+    # mechanical switch: swallow contact bounce in both directions
     filters:
       - delayed_on: 15ms
       - delayed_off: 15ms
+    # First press with a dark display only wakes the backlight and is swallowed,
+    # so nobody triggers a menu action blindly. Afterwards: open the menu, or
+    # confirm the highlighted entry if it is already open.
     on_press:
       then:
         - if:
@@ -499,15 +809,47 @@ binary_sensor:
                     - display_menu.show:
 
   #
+  # Fan State
+  # https://esphome.io/components/binary_sensor/template
+  #
+  # The relais itself stays internal so that nothing can bypass control_script.
+  # This mirrors its state read-only into Home Assistant / MQTT.
+  #
+  - platform: template
+    id: fan_state_id
+    name: Fan
+    icon: mdi:fan
+    device_class: running
+    lambda: |-
+      return id(relais_id).state;
+
+  #
   # Backlight
-  # https://esphome.io/components/binary_sensor/template.html
+  # https://esphome.io/components/binary_sensor/template
+  #
+  # Not a real sensor but a one-shot timer. Callers publish ON followed
+  # immediately by OFF; the delayed_off filter swallows the OFF for
+  # backlight_delay seconds, so on_press lights the display and on_release
+  # turns it off again once the delay expires.
   #
   - platform: template
     id: backlight_id
     internal: True
+    # defaults to False, and the on_boot pulse below is the very first state
+    # this sensor ever sees -- without this its on_press is swallowed and the
+    # boot pulse would only ever switch the backlight off
+    trigger_on_initial_state: True
     filters:
+      # backlight_delay_id is a template number with setup_priority HARDWARE,
+      # the same 800 the on_boot trigger uses, and it is registered later, so
+      # its state is still NaN during the boot pulse. Fall back to the number's
+      # initial_value instead of casting NaN to uint32_t.
       - delayed_off: !lambda |-
-          return id(backlight_delay_id).state * 1000;
+          float seconds = id(backlight_delay_id).state;
+          if (std::isnan(seconds)) {
+            seconds = 10.0f;
+          }
+          return seconds * 1000;
     on_press:
       then:
         - lambda: |-
@@ -515,6 +857,8 @@ binary_sensor:
     on_release:
       then:
         - lambda: |-
+            // keep the light on while someone is navigating the menu; the
+            // "Exit Menu" command re-arms the timer with a fresh pulse
             if (!id(lcd_menu_id).is_active()) {
               id(display_id).no_backlight();
             }
@@ -526,13 +870,13 @@ binary_sensor:
 ################################################################################
 
 #
-# https://esphome.io/components/select/index.html
+# https://esphome.io/components/select/index
 #
 select:
 
   #
   # Mode
-  # https://esphome.io/components/select/template.html
+  # https://esphome.io/components/select/template
   #
   - platform: template
     name: Mode
@@ -544,55 +888,13 @@ select:
       - "Off"
     initial_option: "Automatic"
     optimistic: True
+    # deliberately not restored: after a power cut the device comes back in
+    # Automatic rather than staying in a manual override nobody remembers
     restore_value: False
+    # react immediately instead of waiting for the next interval tick
     on_value:
       then:
-        - lambda: |-
-            if (id(mode_id).state == "Automatic") {
-
-              // only switch
-              if (id(indoor_sensor_error_id) != true || id(outdoor_sensor_error_id) != true) {
-
-                // Taupunkt außen < Taupunkt innen -> Lüfter an
-                if (id(outdoor_dew_point_id).state < id(indoor_dew_point_id).state) {
-                  id(relais_id).turn_on();
-                }
-
-                // Taupunkt außen < Taupunkt innen -> Lüfter aus
-                else if (id(outdoor_dew_point_id).state < id(indoor_dew_point_id).state)
-                {
-                  id(relais_id).turn_off();
-                }
-
-                /*
-                // Taupunkt außen < Taupunkt innen
-                // id(outdoor_dew_point_id).state > id(indoor_dew_point_id).state
-                if (id(delta_dew_point_id).state > (id(dew_point_difference_min_id).state + id(hysteresis_id).state))
-                {
-                  id(relais_id).turn_on();
-                }
-                // Taupunkt außen < Taupunkt innen
-                // id(outdoor_dew_point_id).state < id(indoor_dew_point_id).state
-                else if (id(delta_dew_point_id).state < id(dew_point_difference_min_id).state)
-                {
-                  id(relais_id).turn_off();
-                }
-                else if (id(indoor_temperature_id).state < id(indoor_temperature_min_id).state)
-                {
-                  id(relais_id).turn_off();
-                }
-                else if (id(outdoor_temperature_id).state < id(outdoor_temperature_min_id).state)
-                {
-                  id(relais_id).turn_off();
-                }
-                */
-              }
-
-            } else if (id(mode_id).state == "On") {
-              id(relais_id).turn_on();
-            } else if (id(mode_id).state == "Off") {
-              id(relais_id).turn_off();
-            }
+        - script.execute: control_script
 
 ################################################################################
 #
@@ -601,13 +903,13 @@ select:
 ################################################################################
 
 #
-# https://esphome.io/components/button/index.html
+# https://esphome.io/components/button/index
 #
 button:
 
   #
   # Restart
-  # https://esphome.io/components/button/restart.html
+  # https://esphome.io/components/button/restart
   #
   - platform: restart
     id: restart_id
@@ -616,7 +918,7 @@ button:
 
   #
   # Factory Reset
-  # https://esphome.io/components/button/factory_reset.html
+  # https://esphome.io/components/button/factory_reset
   #
   - platform: factory_reset
     id: factoryreset_id
@@ -625,12 +927,27 @@ button:
 
   #
   # Save Mode
-  # https://esphome.io/components/button/safe_mode.html
+  # https://esphome.io/components/button/safe_mode
   #
   - platform: safe_mode
     id: safemode_id
     name: Restart (Safe Mode)
     icon: mdi:reload
+
+  #
+  # Firmware Update
+  #
+  - platform: template
+    id: update_id
+    name: Firmware Update
+    icon: mdi:update
+    device_class: update
+    entity_category: config
+    on_press:
+      then:
+        - ota.http_request.flash:
+            md5_url: "https://homeassistant.carstenwalther.de/local/ota/${project_name}/firmware.md5"
+            url: "https://homeassistant.carstenwalther.de/local/ota/${project_name}/firmware.ota.bin"
 
 ################################################################################
 #
@@ -639,45 +956,68 @@ button:
 ################################################################################
 
 #
-# https://esphome.io/components/sensor/index.html
+# https://esphome.io/components/sensor/index
 #
+# The climate sensors and everything derived from them run at 30s, not the 5s
+# they used to. Two reasons:
+#   - control_script only runs every 10s (see the interval above), so half the
+#     readings were never evaluated by anything.
+#   - the dht driver reads inside an InterruptLock, roughly 4-5ms per sensor with
+#     interrupts disabled. At 5s that is a recurring blackout for the wifi and
+#     i2c ISRs; 30s cuts it by a factor of six. (Moving to an i2c sensor such as
+#     the sht3xd removes the InterruptLock entirely - see the commented blocks.)
+# A cellar is thermally slow; 30s is still far finer than anything the room
+# does. The visible cost is that breathing on a sensor takes up to 30s to show.
 sensor:
 
   #
   # Uptime
-  # https://esphome.io/components/sensor/uptime.html
+  # https://esphome.io/components/sensor/uptime
   #
   - platform: uptime
-    type: seconds
+    id: uptime_seconds_id
     name: Uptime
+    icon: mdi:timer-outline
+    type: seconds
+    internal: True
+    entity_category: diagnostic
+    device_class: ""
 
   #
   # WiFi Signal in dB
-  # https://esphome.io/components/sensor/wifi_signal.html
+  # https://esphome.io/components/sensor/wifi_signal
   #
   - platform: wifi_signal
     id: wifi_signal_db
-    name: WiFi Signal dB
+    name: WiFi Signal (dBm)
+    icon: mdi:wifi
+    unit_of_measurement: "dBm"
     update_interval: 60s
 
   #
   # WiFi Signal in %
-  # https://esphome.io/components/sensor/wifi_signal.html
+  # https://esphome.io/components/sensor/wifi_signal
   #
   - platform: copy
     id: wifi_signal_percent
+    name: WiFi Signal (%)
+    icon: mdi:wifi
     source_id: wifi_signal_db
-    name: WiFi Signal %
-    filters:
-      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
     unit_of_measurement: "%"
     entity_category: "diagnostic"
     device_class: ""
+    filters:
+    # map dBm to percent: -100 dBm and worse = 0 %, -50 dBm and better = 100 %
+    - lambda: |-
+        return min(max(2 * (x + 100.0), 0.0), 100.0);
 
   #
   # Rotary Encoder
-  # https://esphome.io/components/sensor/rotary_encoder.html
+  # https://esphome.io/components/sensor/rotary_encoder
   #
+  # CLK/DT need no pin mode here: the KY-040 breakout pulls both up itself.
+  # Turning either navigates the menu (when open) or flips the display page.
+  # Like the button, the first turn with a dark display only wakes it.
   - platform: rotary_encoder
     id: rotary_encoder_id
     name: Rotary Encoder
@@ -685,6 +1025,8 @@ sensor:
     pin_a: ${PIN_ROTARY_ENCODER_CLK}
     pin_b: ${PIN_ROTARY_ENCODER_DT}
     restore_mode: ALWAYS_ZERO
+    # note: this only debounces the published counter value, not the
+    # on_clockwise/on_anticlockwise triggers, which fire from the raw pins
     filters:
       debounce: 30ms
     on_anticlockwise:
@@ -711,18 +1053,16 @@ sensor:
                         return id(page_id) -= 1;
                   - if:
                       condition:
+                        # > 2 also catches the OTA page (100), which would
+                        # otherwise take ~98 clicks to leave
                         lambda: |-
-                          return id(page_id) <= 0;
+                          return id(page_id) <= 0 || id(page_id) > 2;
                       then:
                         - globals.set:
                             id: page_id
                             value: !lambda |-
                               return 0;
-#                  - lambda: |-
-#                      id(page_id) = (id(page_id) - 1);
-#                      if (id(page_id) <= 0) {
-#                        id(page_id) = 0;
-#                      }
+
     on_clockwise:
       - if:
           condition:
@@ -754,138 +1094,181 @@ sensor:
                             id: page_id
                             value: !lambda |-
                               return 2;
-#                  - lambda: |-
-#                      id(page_id) = (id(page_id) + 1);
-#                      if (id(page_id) >= 2) {
-#                        id(page_id) = 2;
-#                      }
 
   #
-  # Delty Dew Point
-  # https://esphome.io/components/sensor/template.html
+  # Delta Dew Point
+  # https://esphome.io/components/sensor/template
+  #
+  # Indoor minus outdoor, so a positive value means the outside air is drier
+  # and ventilating removes moisture. This is the quantity control_script
+  # compares against dew_point_difference_min; published for observability
+  # only, the script recomputes it to stay independent of this sensor's cycle.
   #
   - platform: template
-    name: Delta Dew Point
     id: delta_dew_point_id
-    device_class: temperature
-    unit_of_measurement: °C
+    name: Delta Dew Point
     icon: mdi:thermometer-alert
+    unit_of_measurement: °C
+    device_class: temperature
     accuracy_decimals: 1
-    update_interval: 5s
+    update_interval: 30s
     lambda: |-
       return id(indoor_dew_point_id).state - id(outdoor_dew_point_id).state;
 
   #
-  # Absolute Delta Dew Point
-  # https://esphome.io/components/sensor/template.html
+  # Absolute Humidity Delta
+  # https://esphome.io/components/sensor/template
+  #
+  # Same sign convention as the dew point delta above. Diagnostic only --
+  # nothing regulates on this, it just makes the moisture transport visible.
   #
   - platform: template
-    name: Absolute Delta Dew Point
-    id: absolute_delta_dew_point_id
-    device_class: temperature
-    unit_of_measurement: g/m³
+    id: absolute_humidity_delta_id
+    name: Absolute Humidity Delta
     icon: mdi:water-percent-alert
+    unit_of_measurement: g/m³
+    device_class: absolute_humidity
     accuracy_decimals: 1
-    update_interval: 5s
+    update_interval: 30s
     lambda: |-
-      return id(indoor_absolute_dew_point_id).state - id(outdoor_absolute_dew_point_id).state;
+      return id(indoor_absolute_humidity_id).state - id(outdoor_absolute_humidity_id).state;
 
   #
   # Outdoor Temperature
-  # https://esphome.io/components/sensor/dht.html
+  # https://esphome.io/components/sensor/dht
   #
   - platform: dht
     pin: ${PIN_DHT22_OUT}
     model: DHT22
     temperature:
-      name: Outdoor Temperature
       id: outdoor_temperature_id
+      name: Outdoor Temperature
+      icon: mdi:thermometer
       accuracy_decimals: 1
       filters:
         - offset: 0.0
     humidity:
-      name: Outdoor Humidity
       id: outdoor_humidity_id
+      name: Outdoor Humidity
+      icon: mdi:water-percent
       accuracy_decimals: 1
       filters:
         - offset: 0.0
-    update_interval: 5s
+    update_interval: 30s
+# for later use
+#  - platform: sht3xd
+#    address: 0x45          # ADDR-Pin auf VDD
+#    update_interval: 30s
+#    temperature:
+#      id: outdoor_temperature_id
+#      name: Outdoor Temperature
+#      icon: mdi:thermometer
+#      accuracy_decimals: 1
+#    humidity:
+#      id: outdoor_humidity_id
+#      name: Outdoor Humidity
+#      icon: mdi:water-percent
+#      accuracy_decimals: 1
 
   #
   # Outdoor Dew Point
-  # https://esphome.io/components/sensor/template.html
+  # https://esphome.io/components/sensor/template
   #
   - platform: template
-    name: Outdoor Dew Point
     id: outdoor_dew_point_id
-    device_class: temperature
-    unit_of_measurement: °C
+    name: Outdoor Dew Point
     icon: mdi:thermometer-alert
+    unit_of_measurement: °C
+    device_class: temperature
     accuracy_decimals: 1
-    update_interval: 5s
+    update_interval: 30s
     lambda: |-
-      return (243.5 * (log(id(outdoor_humidity_id).state / 100) + ((17.67 * id(outdoor_temperature_id).state) / (243.5 + id(outdoor_temperature_id).state))) / (17.67 - log(id(outdoor_humidity_id).state / 100) - ((17.67 * id(outdoor_temperature_id).state) / (243.5 + id(outdoor_temperature_id).state))));
+      // Magnus formula; clamp the humidity so log() never sees zero
+      const float rh = std::max(id(outdoor_humidity_id).state, 0.1f);
+      const float t = id(outdoor_temperature_id).state;
+      const float gamma = log(rh / 100.0f) + ((17.67f * t) / (243.5f + t));
+      return (243.5f * gamma) / (17.67f - gamma);
 
   #
   # Outdoor Absolute Humidity
-  # https://esphome.io/components/sensor/absolute_humidity.html
+  # https://esphome.io/components/sensor/absolute_humidity
   #
   - platform: absolute_humidity
+    id: outdoor_absolute_humidity_id
     name: Outdoor Absolute Humidity
-    id: outdoor_absolute_dew_point_id
     icon: mdi:water-percent-alert
+    unit_of_measurement: g/m³
     temperature: outdoor_temperature_id
     humidity: outdoor_humidity_id
-    unit_of_measurement: g/m³
     accuracy_decimals: 1
 
   #
   # Indoor Temperature
-  # https://esphome.io/components/sensor/dht.html
+  # https://esphome.io/components/sensor/dht
   #
   - platform: dht
     pin: ${PIN_DHT22_IN}
     model: DHT22
     temperature:
-      name: Indoor Temperature
       id: indoor_temperature_id
+      name: Indoor Temperature
+      icon: mdi:thermometer
       accuracy_decimals: 1
       filters:
         - offset: 0.0
     humidity:
-      name: Indoor Humidity
       id: indoor_humidity_id
+      name: Indoor Humidity
+      icon: mdi:water-percent
       accuracy_decimals: 1
       filters:
         - offset: 0.0
-    update_interval: 5s
+    update_interval: 30s
+# for later use
+#  - platform: sht3xd
+#    address: 0x44          # ADDR-Pin auf GND
+#    update_interval: 30s
+#    temperature:
+#      id: indoor_temperature_id
+#      name: Indoor Temperature
+#      icon: mdi:thermometer
+#      accuracy_decimals: 1
+#    humidity:
+#      id: indoor_humidity_id
+#      name: Indoor Humidity
+#      icon: mdi:water-percent
+#      accuracy_decimals: 1
 
   #
   # Indoor Dew Point
-  # https://esphome.io/components/sensor/template.html
+  # https://esphome.io/components/sensor/template
   #
   - platform: template
-    name: Indoor Dew Point
     id: indoor_dew_point_id
-    device_class: temperature
-    unit_of_measurement: °C
+    name: Indoor Dew Point
     icon: mdi:thermometer-alert
+    unit_of_measurement: °C
+    device_class: temperature
     accuracy_decimals: 1
-    update_interval: 5s
+    update_interval: 30s
     lambda: |-
-      return (243.5 * (log(id(indoor_humidity_id).state / 100) + ((17.67 * id(indoor_temperature_id).state) / (243.5 + id(indoor_temperature_id).state))) / (17.67 - log(id(indoor_humidity_id).state / 100) - ((17.67 * id(indoor_temperature_id).state) / (243.5 + id(indoor_temperature_id).state))));
+      // Magnus formula; clamp the humidity so log() never sees zero
+      const float rh = std::max(id(indoor_humidity_id).state, 0.1f);
+      const float t = id(indoor_temperature_id).state;
+      const float gamma = log(rh / 100.0f) + ((17.67f * t) / (243.5f + t));
+      return (243.5f * gamma) / (17.67f - gamma);
 
   #
   # Indoor Absolute Humidity
-  # https://esphome.io/components/sensor/absolute_humidity.html
+  # https://esphome.io/components/sensor/absolute_humidity
   #
   - platform: absolute_humidity
+    id: indoor_absolute_humidity_id
     name: Indoor Absolute Humidity
-    id: indoor_absolute_dew_point_id
     icon: mdi:water-percent-alert
+    unit_of_measurement: g/m³
     temperature: indoor_temperature_id
     humidity: indoor_humidity_id
-    unit_of_measurement: g/m³
     accuracy_decimals: 1
 
 ################################################################################
@@ -895,14 +1278,18 @@ sensor:
 ################################################################################
 
 #
-# https://esphome.io/components/switch/index.html
+# https://esphome.io/components/switch/index
 #
 switch:
 
   #
   # Relais
-  # https://esphome.io/components/switch/gpio.html
+  # https://esphome.io/components/switch/gpio
   #
+  # Drives the fan. Kept internal on purpose: control_script owns this switch,
+  # and a second writer from Home Assistant would be overridden on the next
+  # interval tick. The read-only fan_state_id binary sensor mirrors it for HA;
+  # to control the fan from outside, set mode_id instead.
   - platform: gpio
     id: relais_id
     name: Fan
@@ -912,7 +1299,11 @@ switch:
 
   #
   # WiFi
-  # https://esphome.io/components/switch/template.html
+  # https://esphome.io/components/switch/template
+  #
+  # Lets the user shut the radio off from the LCD menu, e.g. to silence the
+  # device. The lambda reports the real radio state, so the switch stays
+  # correct even if WiFi is toggled from somewhere else.
   #
   - platform: template
     id: wifi_state_id
@@ -920,8 +1311,6 @@ switch:
     icon: "mdi:wifi"
     internal: False
     optimistic: True
-    #restore_mode: True
-    assumed_state: True
     lambda: |-
       if (!id(wifi_id).is_disabled()) {
         return true;
@@ -935,6 +1324,32 @@ switch:
       then:
         - wifi.disable:
 
+  #
+  # MQTT
+  # https://esphome.io/components/switch/template
+  #
+  # mqtt starts disabled (enable_on_boot: False above); this is the way to turn
+  # it on. Deliberately NOT mirroring the real state with a lambda the way the
+  # WiFi switch does: the only getter available is is_connected(), so the switch
+  # would snap back to off whenever the broker is unreachable - which is exactly
+  # the situation here - and look broken.
+  # ALWAYS_OFF is on purpose: after a watchdog reset the device must come back
+  # in the state known to be stable, not the one that caused the reset.
+  #
+  - platform: template
+    id: mqtt_state_id
+    name: "MQTT"
+    icon: "mdi:transit-connection-variant"
+    internal: False
+    optimistic: True
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      then:
+        - mqtt.enable:
+    turn_off_action:
+      then:
+        - mqtt.disable:
+
 ################################################################################
 #
 # LCD
@@ -942,7 +1357,7 @@ switch:
 ################################################################################
 
 #
-# https://esphome.io/components/display_menu/lcd_menu.html
+# https://esphome.io/components/display_menu/lcd_menu
 #
 lcd_menu:
   id: lcd_menu_id
@@ -979,14 +1394,18 @@ lcd_menu:
           text: 'Hysteresis'
           immediate_edit: False
           number: hysteresis_id
+        # format defaults to "%.1f"; these have step 1.0, so the decimal is
+        # never anything but 0 and only wastes display width
         - type: number
-          text: 'Indoor temp. min.'
+          text: 'In. temp. min.'
           immediate_edit: False
           number: indoor_temperature_min_id
+          format: "%.0f"
         - type: number
-          text: 'Outdoor temp. min.'
+          text: 'Out. temp. min.'
           immediate_edit: False
           number: outdoor_temperature_min_id
+          format: "%.0f"
         - type: back
           text: 'Back'
     #
@@ -997,78 +1416,75 @@ lcd_menu:
       items:
         - type: back
           text: 'Back'
-#        - type: menu
-#          text: 'Date'
-#          items:
-#            - type: back
-#              text: 'Back'
-#            - type: number
-#              text: 'Day'
-#              immediate_edit: False
-#              number: datetime_day_id
-#            - type: number
-#              text: 'Month'
-#              immediate_edit: False
-#              number: datetime_month_id
-#            - type: number
-#              text: 'Year'
-#              immediate_edit: False
-#              number: datetime_year_id
-#            - type: back
-#              text: 'Back'
-#          on_leave:
-#            then:
-#              - datetime.time.set:
-#                  id: ds1307_time
-#                  time: !lambda |-
-#                    return {
-#                      .second: id(datetime_second_id),
-#                      .minute: id(datetime_minute_id),
-#                      .hour: id(datetime_hour_id),
-#                      .day_of_month: id(datetime_day_id),
-#                      .month: id(datetime_month_id),
-#                      .year: id(datetime_year_id)
-#                    };
-#        - type: menu
-#          text: 'Time'
-#          items:
-#            - type: back
-#              text: 'Back'
-#            - type: number
-#              text: 'Hour'
-#              immediate_edit: False
-#              number: datetime_hour_id
-#            - type: number
-#              text: 'Mnute'
-#              immediate_edit: False
-#              number: datetime_minute_id
-#            - type: number
-#              text: 'Second'
-#              immediate_edit: False
-#              number: datetime_second_id
-#            - type: back
-#              text: 'Back'
-#          on_leave:
-#            then:
-#              - datetime.time.set:
-#                  id: ds1307_time
-#                  time: !lambda |-
-#                    return {
-#                      .second: id(datetime_second_id),
-#                      .minute: id(datetime_minute_id),
-#                      .hour: id(datetime_hour_id),
-#                      .day_of_month: id(datetime_day_id),
-#                      .month: id(datetime_month_id),
-#                      .year: id(datetime_year_id)
-#                    };
+        - type: menu
+          text: 'Date'
+          on_enter:
+            then:
+              - script.execute: datetime_load_script
+          on_leave:
+            then:
+              - script.execute: datetime_apply_script
+          items:
+            - type: back
+              text: 'Back'
+            - type: number
+              text: 'Day'
+              immediate_edit: False
+              number: datetime_day_id
+              format: "%.0f"
+            - type: number
+              text: 'Month'
+              immediate_edit: False
+              number: datetime_month_id
+              format: "%.0f"
+            - type: number
+              text: 'Year'
+              immediate_edit: False
+              number: datetime_year_id
+              format: "%.0f"
+            - type: back
+              text: 'Back'
+        - type: menu
+          text: 'Time'
+          on_enter:
+            then:
+              - script.execute: datetime_load_script
+          on_leave:
+            then:
+              - script.execute: datetime_apply_script
+          items:
+            - type: back
+              text: 'Back'
+            - type: number
+              text: 'Hour'
+              immediate_edit: False
+              number: datetime_hour_id
+              format: "%.0f"
+            - type: number
+              text: 'Minute'
+              immediate_edit: False
+              number: datetime_minute_id
+              format: "%.0f"
+            - type: number
+              text: 'Second'
+              immediate_edit: False
+              number: datetime_second_id
+              format: "%.0f"
+            - type: back
+              text: 'Back'
         - type: number
           text: 'Backlight delay'
           immediate_edit: False
           number: backlight_delay_id
+          format: "%.0f"
         - type: switch
           text: 'WiFi'
           immediate_edit: False
           switch: wifi_state_id
+        - type: switch
+          text: 'MQTT'
+          immediate_edit: False
+          switch: mqtt_state_id
         - type: command
           text: 'Restart'
           on_value:
@@ -1091,19 +1507,46 @@ lcd_menu:
       on_value:
         then:
           - display_menu.hide:
+          # re-arm the backlight timer: while the menu was open on_release kept
+          # the backlight on, and without a new pulse it would never turn off
+          - binary_sensor.template.publish:
+              id: backlight_id
+              state: ON
+          - binary_sensor.template.publish:
+              id: backlight_id
+              state: OFF
 
 #
-# https://esphome.io/components/display/lcd_display.html
+# https://esphome.io/components/display/lcd_display
 #
 display:
   - platform: lcd_pcf8574
     dimensions: 20x4
     address: 0x27
     id: display_id
-    update_interval: 125ms
+    # A full 20x4 redraw is 84 bytes * 2 nibbles * 3 single-byte I2C transfers
+    # = 504 transfers, measured at ~170ms on this 100 kHz bus. lcd_base redraws
+    # everything unconditionally, so that cost is paid on every update. At the
+    # former 250ms that tied up ~68% of the main loop and showed up as stalls in
+    # unrelated components (api 2163ms, mqtt keepalive dropping with
+    # No PING_RESP). 1s keeps it under 20%; menu navigation and OTA progress
+    # stay responsive because both call update() directly.
+    # The bus cannot go to 400 kHz: the DS1307 at 0x68 is a 100 kHz part.
+    # NOTE: this is throughput hygiene, not the fix for the watchdog resets.
+    # Those trigger with loopTask not feeding the wdt while CPU 1 sits in IDLE1,
+    # i.e. the loop is blocked waiting, not busy computing - see the analysis in
+    # the repo notes. Fewer transfers narrows the window but does not close it.
+    update_interval: 1s
+    # Eight CGRAM slots (positions 0..7) are available. In lambdas they are
+    # referenced as escapes \x01..\x07 -- position 0 cannot be written as \x00
+    # because that terminates a C string, so it is addressed through its
+    # mirror at 0x08 (see mark_back in the lcd_menu above).
+    # In use: \x01 degrees, \x02 fan running, \x03 no signal, \x04 signal,
+    # \x05 attention, \x06 mqtt connected, \x07 mqtt enabled but not connected.
+    # All eight slots are taken - adding another icon means retiring one.
     user_characters:
       - position: 0
-        data:  # mark_back symbol
+        data:  # mark_back symbol, referenced as 0x08
           - 0b00100
           - 0b01000
           - 0b11110
@@ -1125,13 +1568,18 @@ display:
           - 0b00000
       - position: 2
         data:
-          # ^3 symbol
-          - 0b00110
-          - 0b01001
-          - 0b00010
-          - 0b00001
-          - 0b01001
-          - 0b00110
+          # Fan running: two-blade rotor around a hub. The asymmetry reads as
+          # rotation and keeps it distinct from the round mqtt discs.
+          # This slot used to hold a "^3" glyph for g/m3 units, which no page
+          # ever drew - the absolute humidity sensors are exported to HA/MQTT
+          # but not shown on the LCD. All eight slots are taken now, so getting
+          # that glyph back means giving up another one.
+          - 0b00000
+          - 0b11000
+          - 0b11100
+          - 0b00100
+          - 0b00111
+          - 0b00011
           - 0b00000
           - 0b00000
       - position: 3
@@ -1159,14 +1607,47 @@ display:
       - position: 5
         data:
           # Attention Icon
-          - 0b01111
-          - 0b01111
-          - 0b01111
+          - 0b00110
+          - 0b00110
+          - 0b00110
           - 0b00110
           - 0b00110
           - 0b00000
           - 0b00110
           - 0b00110
+      - position: 6
+        data:
+          # MQTT connected: filled disc. Deliberately not a bar/arc shape so it
+          # cannot be confused with the wifi signal glyphs next to it.
+          - 0b00000
+          - 0b00000
+          - 0b01110
+          - 0b11111
+          - 0b11111
+          - 0b11111
+          - 0b01110
+          - 0b00000
+      - position: 7
+        data:
+          # MQTT enabled but not connected: same disc, hollow. Filled vs hollow
+          # reads at a glance on a 5x8 cell.
+          - 0b00000
+          - 0b00000
+          - 0b01110
+          - 0b10001
+          - 0b10001
+          - 0b10001
+          - 0b01110
+          - 0b00000
+    # Layout (20x4). Row 0 is a status bar drawn on every page, rows 1..3 are
+    # owned by the current page:
+    #
+    #   col 0    5         13    17 18 19
+    #       HH:MM           !     % o  ~   <- time, error, fan, mqtt, wifi
+    #                                          (icons cluster on the right)
+    #       <-- indoor --><-- outdoor -->  <- page 0: cols 0..8 / 9..17
+    #
+    # When the menu is open it owns the whole display and nothing else is drawn.
     lambda: |-
       id(lcd_menu_id).draw();
       if (!id(lcd_menu_id).is_active())
@@ -1176,19 +1657,21 @@ display:
 
         switch (id(page_id))
         {
-          // Standby
+          // Standby: indoor values in the left column, outdoor in the right.
+          // "%7.1f\x01" "C" is split so the compiler does not read \x01C as a
+          // single hex escape; \x01 is the degree glyph from user_characters.
           case 0:
             // Temperatures
-            it.printf(0, 1, "%7.1f\x01" "C", (!isnan(id(indoor_temperature_id).state) ? id(indoor_temperature_id).state : 0.0));
-            it.printf(9, 1, "%7.1f\x01" "C", (!isnan(id(outdoor_temperature_id).state) ? id(outdoor_temperature_id).state : 0.0));
+            it.printf(0, 1, "%7.1f\x01" "C", id(indoor_temperature_id).state);
+            it.printf(9, 1, "%7.1f\x01" "C", id(outdoor_temperature_id).state);
 
             // Humidities
-            it.printf(0, 2, "%7.1f %%", (!isnan(id(indoor_humidity_id).state) ? id(indoor_humidity_id).state : 0.0));
-            it.printf(9, 2, "%7.1f %%", (!isnan(id(outdoor_humidity_id).state) ? id(outdoor_humidity_id).state : 0.0));
+            it.printf(0, 2, "%7.1f %%", id(indoor_humidity_id).state);
+            it.printf(9, 2, "%7.1f %%", id(outdoor_humidity_id).state);
 
             // Dewpoints
-            it.printf(0, 3, "%7.1f\x01" "C", (!isnan(id(indoor_dew_point_id).state) ? id(indoor_dew_point_id).state : 0.0));
-            it.printf(9, 3, "%7.1f\x01" "C", (!isnan(id(outdoor_dew_point_id).state) ? id(outdoor_dew_point_id).state : 0.0));
+            it.printf(0, 3, "%7.1f\x01" "C", id(indoor_dew_point_id).state);
+            it.printf(9, 3, "%7.1f\x01" "C", id(outdoor_dew_point_id).state);
             break;
 
           // WiFi Info
@@ -1197,7 +1680,7 @@ display:
               it.print(0, 2, "    WiFi disabled");
             } else {
               if (id(wifi_id).is_connected()) {
-                it.printf(0, 1, "IP: %16s%", WiFi.localIP().toString().c_str());
+                it.printf(0, 1, "IP: %16s", id(ip_address_id).state.c_str());
                 it.printf(0, 2, "Signal: %11.1f%%", id(wifi_signal_percent).state);
               } else {
                 it.print(0, 2, "   WiFi connecting");
@@ -1205,7 +1688,8 @@ display:
             }
             break;
 
-          // Sensor missing
+          // Sensor missing. The outdoor line moves down to row 3 when the
+          // indoor line already occupies row 2, so both can be shown at once.
           case 2:
             if(!id(outdoor_sensor_error_id) && !id(indoor_sensor_error_id)) {
               it.print(0, 2, "   System is fine!");
@@ -1224,9 +1708,11 @@ display:
             }
             break;
 
-          // OTA
+          // OTA. Reached only via the OTA handlers, never by turning the
+          // encoder; turning leaves it again because 100 is outside 0..2.
           case 100:
-            // Backlight On
+            // force the light on regardless of the backlight timer, an update
+            // can take longer than backlight_delay
             it.backlight();
 
             // Show OTA Update
@@ -1247,23 +1733,36 @@ display:
             break;
         }
 
-        // Show Time
+        // ---- status bar on row 0, drawn on top of every page ----
+
+        // Show Time; --:-- while the RTC has not delivered a valid time yet
         if (id(ds1307_time).now().is_valid()) {
           it.strftime(0, 0, "%H:%M", id(ds1307_time).now());
-        } else if (id(homeassistant_time).now().is_valid()) {
-          it.strftime(0, 0, "%H:%M", id(homeassistant_time).now());
-        } else if (id(sntp_time).now().is_valid()) {
-          it.strftime(0, 0, "%H:%M", id(sntp_time).now());
         } else {
           it.print(0, 0, "--:--");
         }
 
-        // show error icon
-        it.printf(13, 0, "%s%", (id(ota_state_id) == ota::OTA_ERROR || id(indoor_sensor_error_id) || id(outdoor_sensor_error_id)) ? "\x05" : "");
+        // show error icon (attention glyph) on a failed OTA or a dead sensor;
+        // empty string when everything is fine, which leaves the cell blank
+        it.printf(13, 0, "%s", (id(ota_state_id) == ota::OTA_ERROR || id(indoor_sensor_error_id) || id(outdoor_sensor_error_id)) ? "\x05" : "");
 
-        // FAN State
-        it.printf(15, 0, "%3s%", id(relais_id).state ? "ON" : "OFF");
+        // Fan: rotor glyph while running, blank while stopped. Same idiom as
+        // the error icon above - an empty string leaves the cell as cleared.
+        // Stopped is the normal state, so blank is the quiet default and the
+        // eye is drawn only when the fan actually runs.
+        it.printf(17, 0, "%s", id(relais_id).state ? "\x02" : "");
 
-        // WiFi Connection State
+        // MQTT state, three-valued unlike wifi: blank while the client is
+        // disabled (the default - see enable_on_boot), hollow disc once the
+        // user switched it on from the menu, filled disc when the broker
+        // actually answers. The distinction matters here because this broker
+        // drops the connection regularly.
+        if (!id(mqtt_state_id).state) {
+          it.print(18, 0, " ");
+        } else {
+          it.print(18, 0, id(mqtt_client_id).is_connected() ? "\x06" : "\x07");
+        }
+
+        // WiFi Connection State: signal / no-signal glyph in the last cell
         it.printf(19, 0, "%s", id(wifi_id).is_connected() ? "\x04" : "\x03");
       }
