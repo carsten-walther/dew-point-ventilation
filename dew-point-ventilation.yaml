@@ -31,6 +31,17 @@ substitutions:
   PIN_ROTARY_ENCODER_DT: GPIO26
   PIN_ROTARY_ENCODER_SW: GPIO27
 
+  #
+  # Relay protection
+  #
+  # Minimum time the fan must keep running before the dew point logic may stop
+  # it, and minimum pause before it may start again. Protects the motor and the
+  # relay contacts from short cycling when the difference sits on the threshold.
+  # Safety paths (sensor fault, temperature limits, manual Off) ignore these and
+  # switch off immediately - protection must never outrank safety.
+  MIN_RUN_TIME_S: "300"
+  MIN_PAUSE_TIME_S: "180"
+
 ################################################################################
 #
 # General Settings
@@ -216,40 +227,56 @@ mqtt:
   password: !secret mqtt_password
   # same reasoning as for the api above
   reboot_timeout: 0s
-  # Off at boot. The off-site broker sends a TCP RST every few minutes and the
-  # reconnect blocks loopTask long enough for the task watchdog to reboot the
-  # device (see the measurements below). Everything the device needs to regulate
-  # works without mqtt, so it stays off until the user asks for it via the
-  # "MQTT" entry in the LCD menu (switch mqtt_state_id).
+  # Off at boot: every mqtt reconnect blocks loopTask long enough for the 5s
+  # task watchdog to reboot the device. Everything needed to regulate works
+  # without mqtt, so it stays off until asked for via the "MQTT" entry in the
+  # LCD menu (switch mqtt_state_id).
+  #
+  # ROOT CAUSE, established 2026-08-02: the broker runs on THIS network but is
+  # addressed by its public DynDNS name, so every packet takes the path
+  # device -> router -> NAT -> back into the LAN. Three facts pin it down:
+  #   mqtt.carstenwalther.de -> mqtt-walther.dynv6.net -> 92.206.232.135
+  #   public IP of the network this device sits in     -> 92.206.232.135
+  #   source address Mosquitto logs for this device    -> 92.206.232.135
+  # The broker seeing the WAN address instead of a LAN one proves the router is
+  # source-NATing its own hairpin. Consumer routers do this badly: small NAT
+  # tables, aggressive idle timeouts, least reliable path in the house.
+  #
+  # THE FIX is to point mqtt_broker at the broker's LAN IP. Everything below is
+  # mitigation that was measured and found insufficient - do not mistake any of
+  # it for a solution.
   enable_on_boot: False
-  # MEASURED 2026-08-02: with discovery on, this device task-watchdog reset
-  # every 2.5-5 minutes. Disabling mqtt entirely gave 50+ minutes clean, which
-  # pinned the cause here. The broker is off-site and the link drops constantly
-  # ("No PING_RESP", "TCP disconnected"), and ESPHome republishes the discovery
-  # payload for all ~50 entities on every reconnect. Those bursts blocked
-  # loopTask for 1.2-1.5s at a time (api was seen at 2163ms) until the 5s task
-  # watchdog fired - loopTask starved while both CPUs sat in IDLE.
+
+  # MEASURED: with discovery on, watchdog reset every 2.5-5 minutes; mqtt off
+  # entirely gave 50+ minutes clean. ESPHome republishes the discovery payload
+  # for all ~50 entities on every reconnect, and those bursts blocked loopTask
+  # for 1.2-1.5s at a time (api was seen at 2163ms).
   # Discovery messages are retained, so entities already known to Home Assistant
   # survive this being off. Turn it back on briefly if you ever add entities.
   discovery: False
-  # Default is 15s, which is too tight for this off-site broker: the PINGRESP
-  # regularly missed the window ("No PING_RESP"), each miss dropping the link.
-  # The reconnect is what kills the device - ESPHome tears the client down from
-  # loopTask, and while the mqtt task is stuck in a socket operation over the
-  # bad WAN link that call blocks. Measured signature: the loop goes silent
-  # mid-interval (the 5s DHT poll simply stops) with no mqtt log line before it,
-  # then the 5s task watchdog fires. Stretching the window cuts the disconnect
-  # rate and with it the teardown storm.
-  # NOT a cure, and measured as such: mean time between resets went from ~5min
-  # to 18min26s, then the watchdog fired again. The trigger is logged plainly -
-  # "tcp_read error, errno=Connection reset by peer" (socket errno 104) from the
-  # broker, then ~90s of reconnect attempts, then the watchdog. The broker is
-  # actively closing the connection; this is not packet loss.
-  # Worth checking broker-side: a duplicate client_id makes a broker kick the
-  # older session exactly like this. ESPHome defaults client_id to the device
-  # name - see CONF_CLIENT_ID if another client might be using the same one.
-  # (Delaying the mqtt start via enable_on_boot was tried and did NOT help -
-  # the reset came ~1 minute after mqtt connected, wherever that fell.)
+
+  # Default is 15s. MEASURED: raising it moved the mean time between resets from
+  # ~5min to 18min26s - and then the watchdog fired again after 1min40s. No
+  # reliable improvement; kept only because a wider window genuinely lowers the
+  # disconnect rate.
+  # Device-side signature: the loop goes silent mid-interval (the DHT poll
+  # simply stops) with no mqtt log line before it, then the watchdog, with
+  # loopTask starved while both CPUs sit in IDLE.
+  # Broker-side the dominant disconnect reason is "has exceeded timeout" (~35 in
+  # one afternoon) against ~9 protocol errors.
+  #
+  # NOT the cause, although the log line exists: a duplicate client_id. Every
+  # "already connected, closing old connection" in the broker log comes from the
+  # same source address and is immediately followed by the same client
+  # reconnecting - this device racing its own stale session after a silent drop,
+  # not a second client. ESPHome builds the id as device name + full MAC
+  # (dew-point-ventilation-ec64c98652d0), which does not collide by accident.
+  # The "truncated to 23 characters" comment in mqtt_client.h is stale; the
+  # buffer is MAX_NAME_WITH_SUFFIX_SIZE = 128, so the full 34 characters fit.
+  #
+  # Also tried and useless: delaying the mqtt start (enable_on_boot plus a timed
+  # mqtt.enable). The reset came ~1 minute after mqtt connected, wherever in the
+  # boot that fell.
   keepalive: 60s
 
 #
@@ -338,6 +365,42 @@ globals:
     restore_value: no
     initial_value: 'false'
 
+  # Why the fan is in its current state. control_script sets this on every path
+  # it can take, including the ones that return early, so the value is never
+  # stale. Rendered to text by fan_reason_text_id and shown on display page 3.
+  # Codes: 0 ventilating, 1 difference too small, 2 indoor too cold,
+  #        3 outdoor too cold, 4 sensor fault, 5 manual on, 6 manual off,
+  #        7 held on by MIN_RUN_TIME_S, 8 held off by MIN_PAUSE_TIME_S
+  - id: fan_reason_id
+    type: int
+    restore_value: no
+    initial_value: '6'
+
+  # Fan statistics. Runtime is accumulated in whole seconds when the fan stops;
+  # while it runs, the in-progress part is added by the sensor lambda so the
+  # reported value is never behind. Both survive a restart, but a power cut
+  # loses whatever run was in progress - the preference is only written
+  # periodically by ESPHome.
+  - id: fan_runtime_s_id
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: fan_cycles_id
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  # millis() when the current run started, 0 while stopped.
+  - id: fan_on_since_ms_id
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # millis() of the last actual state change, for the min run/pause guards.
+  # Unsigned arithmetic makes the millis() rollover after ~49 days harmless.
+  - id: fan_last_change_ms_id
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
 #
 # https://esphome.io/components/i2c
 #
@@ -378,42 +441,73 @@ script:
     mode: restart
     then:
       - lambda: |-
+          // Every path sets fan_reason_id before it acts, so the reason a user
+          // sees on page 3 and in Home Assistant always matches what the relay
+          // is doing. The paths that return early are exactly the ones that
+          // used to be invisible from outside - Fan=OFF looked identical for a
+          // manual stop, a cold night, a broken sensor and a small difference.
+
           // manual override
           const auto mode = id(mode_id).current_option();
           if (mode == "On") {
+            id(fan_reason_id) = 5;
             id(relais_id).turn_on();
             return;
           }
           if (mode == "Off") {
+            id(fan_reason_id) = 6;
             id(relais_id).turn_off();
             return;
           }
 
           // automatic mode: never regulate on implausible sensor values
           if (id(indoor_sensor_error_id) || id(outdoor_sensor_error_id)) {
+            id(fan_reason_id) = 4;
             id(relais_id).turn_off();
             return;
           }
 
-          // safety limits take precedence over the dew point difference
-          if (id(indoor_temperature_id).state < id(indoor_temperature_min_id).state ||
-              id(outdoor_temperature_id).state < id(outdoor_temperature_min_id).state) {
+          // Safety limits take precedence over the dew point difference. Split
+          // into two checks so the reason can name the offending side.
+          if (id(indoor_temperature_id).state < id(indoor_temperature_min_id).state) {
+            id(fan_reason_id) = 2;
+            id(relais_id).turn_off();
+            return;
+          }
+          if (id(outdoor_temperature_id).state < id(outdoor_temperature_min_id).state) {
+            id(fan_reason_id) = 3;
             id(relais_id).turn_off();
             return;
           }
 
           const float delta = id(indoor_dew_point_id).state - id(outdoor_dew_point_id).state;
           const float minimum = id(dew_point_difference_min_id).state;
+          const bool running = id(relais_id).state;
+          // unsigned subtraction, so a millis() rollover is harmless
+          const uint32_t since_change = millis() - id(fan_last_change_ms_id);
 
           // dew point outside sufficiently lower than inside -> ventilate
           if (delta > minimum + id(hysteresis_id).state) {
+            if (!running && since_change < ${MIN_PAUSE_TIME_S} * 1000UL) {
+              id(fan_reason_id) = 8;  // wants to start, pause not over yet
+              return;
+            }
+            id(fan_reason_id) = 0;
             id(relais_id).turn_on();
           }
           // difference collapsed -> stop
           else if (delta < minimum) {
+            if (running && since_change < ${MIN_RUN_TIME_S} * 1000UL) {
+              id(fan_reason_id) = 7;  // wants to stop, minimum runtime not met
+              return;
+            }
+            id(fan_reason_id) = 1;
             id(relais_id).turn_off();
           }
           // in between: keep the current state (that is the hysteresis)
+          else {
+            id(fan_reason_id) = running ? 0 : 1;
+          }
 
   #
   # Load the RTC into the datetime helper numbers
@@ -685,6 +779,35 @@ number:
 # https://esphome.io/components/text_sensor/index
 #
 text_sensor:
+
+  #
+  # Fan state reason
+  # https://esphome.io/components/text_sensor/template
+  #
+  # Answers "why is the fan not running?", which used to be invisible: the only
+  # outward signal was Fan=OFF, identical for a manual stop, a cold night, a
+  # broken sensor and a difference that is simply too small.
+  # Strings stay within 20 characters so they fit one LCD row unabbreviated.
+  #
+  - platform: template
+    id: fan_reason_text_id
+    name: Fan State Reason
+    icon: mdi:information-outline
+    entity_category: diagnostic
+    update_interval: 10s
+    lambda: |-
+      switch (id(fan_reason_id)) {
+        case 0: return {"Ventilating"};
+        case 1: return {"Diff too small"};
+        case 2: return {"Indoor too cold"};
+        case 3: return {"Outdoor too cold"};
+        case 4: return {"Sensor fault"};
+        case 5: return {"Manual: On"};
+        case 6: return {"Manual: Off"};
+        case 7: return {"Min runtime hold"};
+        case 8: return {"Min pause hold"};
+      }
+      return {"Unknown"};
 
   #
   # ESPHome Version
@@ -1053,10 +1176,10 @@ sensor:
                         return id(page_id) -= 1;
                   - if:
                       condition:
-                        # > 2 also catches the OTA page (100), which would
-                        # otherwise take ~98 clicks to leave
+                        # > 3 also catches the OTA page (100), which would
+                        # otherwise take ~97 clicks to leave
                         lambda: |-
-                          return id(page_id) <= 0 || id(page_id) > 2;
+                          return id(page_id) <= 0 || id(page_id) > 3;
                       then:
                         - globals.set:
                             id: page_id
@@ -1088,12 +1211,53 @@ sensor:
                   - if:
                       condition:
                         lambda: |-
-                          return id(page_id) >= 2;
+                          return id(page_id) >= 3;
                       then:
                         - globals.set:
                             id: page_id
                             value: !lambda |-
-                              return 2;
+                              return 3;
+
+  #
+  # Delta Dew Point
+  # https://esphome.io/components/sensor/template
+  #
+  #
+  # Fan statistics
+  # https://esphome.io/components/sensor/template
+  #
+  # Runtime tells you whether the settings actually do anything - never running
+  # and always running are both worth noticing. The cycle count is the wear
+  # indicator for the relay contacts.
+  #
+  - platform: template
+    id: fan_runtime_h_id
+    name: Fan Runtime
+    icon: mdi:timer-outline
+    unit_of_measurement: h
+    device_class: duration
+    state_class: total_increasing
+    accuracy_decimals: 2
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      // add the run in progress so the value never lags a whole run behind
+      uint32_t seconds = id(fan_runtime_s_id);
+      if (id(fan_on_since_ms_id) != 0) {
+        seconds += (millis() - id(fan_on_since_ms_id)) / 1000;
+      }
+      return seconds / 3600.0f;
+
+  - platform: template
+    id: fan_cycles_sensor_id
+    name: Fan Switch Cycles
+    icon: mdi:counter
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return id(fan_cycles_id);
 
   #
   # Delta Dew Point
@@ -1296,6 +1460,23 @@ switch:
     icon: mdi:fan
     pin: ${PIN_RELAIS}
     internal: True
+    # Switch::publish_state() runs the value through a deduplicator, so these
+    # fire on real transitions only - not on every turn_on() that control_script
+    # issues each interval tick. That makes them safe as counting points.
+    on_turn_on:
+      then:
+        - lambda: |-
+            id(fan_on_since_ms_id) = millis();
+            id(fan_last_change_ms_id) = millis();
+            id(fan_cycles_id) += 1;
+    on_turn_off:
+      then:
+        - lambda: |-
+            if (id(fan_on_since_ms_id) != 0) {
+              id(fan_runtime_s_id) += (millis() - id(fan_on_since_ms_id)) / 1000;
+              id(fan_on_since_ms_id) = 0;
+            }
+            id(fan_last_change_ms_id) = millis();
 
   #
   # WiFi
@@ -1645,7 +1826,13 @@ display:
     #   col 0    5         13    17 18 19
     #       HH:MM           !     % o  ~   <- time, error, fan, mqtt, wifi
     #                                          (icons cluster on the right)
-    #       <-- indoor --><-- outdoor -->  <- page 0: cols 0..8 / 9..17
+    #       <-- indoor --><-- outdoor -->  <- page 1: cols 0..8 / 9..17
+    #
+    # Pages reachable by turning the encoder: 0 decision (delta vs. setpoint
+    # and the reason), 1 measurements, 2 wifi, 3 faults. Page 0 is where the
+    # device sits by default, because it answers the question the device exists
+    # for; the raw measurements are one click away.
+    # Page 100 is OTA and is only entered by the update handlers.
     #
     # When the menu is open it owns the whole display and nothing else is drawn.
     lambda: |-
@@ -1657,10 +1844,19 @@ display:
 
         switch (id(page_id))
         {
-          // Standby: indoor values in the left column, outdoor in the right.
-          // "%7.1f\x01" "C" is split so the compiler does not read \x01C as a
-          // single hex escape; \x01 is the degree glyph from user_characters.
+          // Decision page, and deliberately the one you land on: it answers
+          // "is it ventilating, and if not why" without any mental arithmetic.
+          // The measurements behind it are one click away on page 1.
           case 0:
+            it.printf(0, 1, "Delta   %6.1f\x01" "C", id(delta_dew_point_id).state);
+            it.printf(0, 2, "Minimum %6.1f\x01" "C", id(dew_point_difference_min_id).state);
+            it.printf(0, 3, "%s", id(fan_reason_text_id).state.c_str());
+            break;
+
+          // Measurements: indoor values in the left column, outdoor in the
+          // right. "%7.1f\x01" "C" is split so the compiler does not read \x01C
+          // as a single hex escape; \x01 is the degree glyph.
+          case 1:
             // Temperatures
             it.printf(0, 1, "%7.1f\x01" "C", id(indoor_temperature_id).state);
             it.printf(9, 1, "%7.1f\x01" "C", id(outdoor_temperature_id).state);
@@ -1675,7 +1871,7 @@ display:
             break;
 
           // WiFi Info
-          case 1:
+          case 2:
             if (id(wifi_id).is_disabled()) {
               it.print(0, 2, "    WiFi disabled");
             } else {
@@ -1690,7 +1886,7 @@ display:
 
           // Sensor missing. The outdoor line moves down to row 3 when the
           // indoor line already occupies row 2, so both can be shown at once.
-          case 2:
+          case 3:
             if(!id(outdoor_sensor_error_id) && !id(indoor_sensor_error_id)) {
               it.print(0, 2, "   System is fine!");
             } else {
@@ -1709,7 +1905,7 @@ display:
             break;
 
           // OTA. Reached only via the OTA handlers, never by turning the
-          // encoder; turning leaves it again because 100 is outside 0..2.
+          // encoder; turning leaves it again because 100 is outside 0..3.
           case 100:
             // force the light on regardless of the backlight timer, an update
             // can take longer than backlight_delay

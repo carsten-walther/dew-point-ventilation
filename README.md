@@ -14,6 +14,7 @@ optional conveniences, not requirements.
 ## Table of contents
 
 - [How it works](#how-it-works)
+- [Why the fan is doing what it does](#why-the-fan-is-doing-what-it-does)
 - [Hardware](#hardware)
 - [Pinout](#pinout)
 - [Display](#display)
@@ -76,6 +77,35 @@ otherwise                      →  keep current state
 The band between `minimum` and `minimum + hysteresis` is the hysteresis: inside
 it nothing changes, which prevents the relay from chattering when the difference
 hovers around the threshold.
+
+5. **Minimum runtime and pause.** Step 4 may not stop a fan that has been running
+   for less than `MIN_RUN_TIME_S`, nor start one that has been off for less than
+   `MIN_PAUSE_TIME_S`. This protects the motor and the relay contacts from short
+   cycling.
+
+   Steps 1–3 deliberately ignore these limits and switch off immediately.
+   Contact protection must never outrank safety: a faulty sensor or a
+   temperature limit has to stop the fan on the spot.
+
+### Why the fan is doing what it does
+
+Every path through the control script — including the ones that abort early —
+records a reason code. It is published as the `Fan State Reason` text sensor and
+shown on display page 0:
+
+| Reason | Meaning |
+|--------|---------|
+| `Ventilating` | Fan running, outside air is drier |
+| `Diff too small` | Dew point difference below the threshold |
+| `Indoor too cold` | Indoor temperature under its minimum |
+| `Outdoor too cold` | Outdoor temperature under its minimum |
+| `Sensor fault` | A sensor reads implausibly |
+| `Manual: On` / `Manual: Off` | Mode override active |
+| `Min runtime hold` | Wants to stop, minimum runtime not reached yet |
+| `Min pause hold` | Wants to start, minimum pause not over yet |
+
+Without this, the only outward signal was `Fan: OFF` — identical for a manual
+stop, a cold night, a broken sensor and a difference that is simply too small.
 
 ---
 
@@ -162,15 +192,22 @@ MQTT is deliberately three-valued rather than two-valued like Wi-Fi, so that
 
 ### Pages
 
-Turn the encoder to cycle through pages 0–2. Page 100 is reached only by the OTA
+Turn the encoder to cycle through pages 0–3. Page 100 is reached only by the OTA
 handlers.
 
 | Page | Content |
 |------|---------|
-| 0 | Indoor values on the left, outdoor on the right: temperature, humidity, dew point |
-| 1 | Wi-Fi status: IP address and signal strength, or a note when disabled/connecting |
-| 2 | Sensor errors, or "System is fine!" |
+| 0 | **Decision page:** current dew point difference, the threshold it is compared against, and the reason for the current fan state |
+| 1 | Indoor values on the left, outdoor on the right: temperature, humidity, dew point |
+| 2 | Wi-Fi status: IP address and signal strength, or a note when disabled/connecting |
+| 3 | Sensor errors, or "System is fine!" |
 | 100 | OTA progress, forced to stay backlit for the duration of the update |
+
+Page 0 is the default view because it answers the question the device exists for
+— is it ventilating, and if not, why. The other pages show the inputs behind
+that answer and are one click away. Previously the first page showed six numbers
+from which you had to subtract two dew points in your head and then recall the
+setpoint.
 
 ### Backlight
 
@@ -226,6 +263,18 @@ on leaving it. Impossible dates such as 31 February are rejected on apply.
 All settings survive a restart. The date/time helper values are scratch values
 and are not persisted.
 
+### Compile-time constants
+
+Not adjustable at runtime; change them in the `substitutions` block and reflash:
+
+| Constant | Default | Meaning |
+|----------|---------|---------|
+| `MIN_RUN_TIME_S` | 300 s | Minimum time the fan keeps running before the dew point logic may stop it |
+| `MIN_PAUSE_TIME_S` | 180 s | Minimum pause before it may start again |
+
+They are constants rather than menu entries to keep the menu focused on the
+settings that are actually worth changing during operation.
+
 ---
 
 ## Home Assistant / MQTT
@@ -240,6 +289,17 @@ Exposed entities:
 | Indoor Humidity | Outdoor Humidity | Absolute Humidity Delta |
 | Indoor Dew Point | Outdoor Dew Point | WiFi Signal (dBm) / (%) |
 | Indoor Absolute Humidity | Outdoor Absolute Humidity | |
+
+**Diagnostics**
+
+- `Fan State Reason` — why the fan is on or off, see
+  [Why the fan is doing what it does](#why-the-fan-is-doing-what-it-does)
+- `Fan Runtime` (hours) — whether the settings actually do anything; never
+  running and always running are both worth noticing
+- `Fan Switch Cycles` — wear indicator for the relay contacts
+
+Runtime and cycle count survive a restart. A power cut loses whatever run was in
+progress, because the preference is only written periodically.
 
 **Other entities**
 
@@ -265,10 +325,9 @@ interval tick. To control the fan from outside, set `Mode` instead.
 `restore_mode: ALWAYS_OFF`. MQTT must be switched on explicitly, either from the
 LCD menu (*System → MQTT*) or via Home Assistant.
 
-This is not a preference, it is the outcome of a measurement. With an off-site
-broker that resets the TCP connection every few minutes, the reconnect blocks
-ESPHome's main loop long enough for the 5 s task watchdog to reboot the device.
-Observed behaviour:
+This is not a preference, it is the outcome of a measurement. Every time the MQTT
+connection drops, the reconnect blocks ESPHome's main loop long enough for the
+5 s task watchdog to reboot the device. Observed behaviour:
 
 | Configuration | Result |
 |---------------|--------|
@@ -278,18 +337,46 @@ Observed behaviour:
 | `keepalive: 60s` | 18 min, then 1 min 40 s — no reliable improvement |
 | MQTT disabled | 50+ minutes clean |
 
-The trigger appears in the log as
+On the device the trigger appears as
 `tcp_read error, errno=Connection reset by peer` (socket errno 104), followed by
-about 90 s of reconnect attempts and then the watchdog. Because the reset comes
-*from the broker*, this is not packet loss or a weak Wi-Fi link.
+about 90 s of reconnect attempts and then the watchdog.
+
+### Root cause: the broker is reached the long way round
+
+The broker runs on the **same local network** as this device, but is addressed by
+its public DynDNS name. The evidence:
+
+```
+mqtt.carstenwalther.de → mqtt-walther.dynv6.net → 92.206.232.135
+public IP of the network the device sits in     → 92.206.232.135   (identical)
+source address Mosquitto logs for this device   → 92.206.232.135
+```
+
+Every packet therefore travels device → router → NAT → back into the LAN →
+broker. That the broker sees the WAN address instead of a LAN address proves the
+router is source-NATing the hairpin. Consumer routers handle this badly: small
+NAT tables, aggressive idle timeouts, and it is by far the least reliable path in
+the house.
+
+Mosquitto's own log confirms the consequence — the dominant disconnect reason is
+`has exceeded timeout` (~35 occurrences in one afternoon) against ~9 protocol
+errors.
+
+**The fix is to point the device at the broker's LAN IP** instead of the DynDNS
+name. No hairpin, no NAT table, no dependency on external DNS — and the
+`Couldn't resolve IP address` warnings disappear with it.
 
 `ALWAYS_OFF` is deliberate: after a watchdog reset the device must come back in
 the state known to be stable, not the one that caused the reset.
 
-**If you want MQTT permanently:** use a broker on the local network. That removes
-the WAN path that produces the resets. Worth checking first is whether a
-duplicate `client_id` exists — a broker kicks the older session exactly this way,
-and ESPHome derives the client ID from the device name by default.
+> **Not the cause: a duplicate `client_id`.** The broker log does contain
+> `already connected, closing old connection`, but every occurrence comes from
+> the *same* source address, immediately followed by the same client
+> reconnecting. That is this device racing its own stale session after a silent
+> drop, not a second client. ESPHome derives the ID as device name + full MAC
+> (`dew-point-ventilation-ec64c98652d0`), which does not collide by accident.
+> The `mqtt_client.h` comment claiming truncation to 23 characters is stale —
+> the buffer is `MAX_NAME_WITH_SUFFIX_SIZE = 128`.
 
 ### Home Assistant API
 
@@ -337,8 +424,8 @@ it is reading correctly.
 > genuinely reach 95–100 % RH — the very situation this device exists for. If it
 > ever faults a correct reading, raise or drop that bound.
 
-When a sensor is flagged, the attention icon appears in the status bar and page 2
-names the affected sensor.
+When a sensor is flagged, the attention icon appears in the status bar, page 0
+reports `Sensor fault` as the reason, and page 3 names the affected sensor.
 
 ---
 
