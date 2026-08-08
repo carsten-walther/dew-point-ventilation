@@ -13,20 +13,17 @@ substitutions:
   author_name: carsten-walther
   friendly_name: Taupunktlüftung
   comment: Taupunktlüftung zur Steuerung von Abluftventilatoren
-  version: 2026.8.2
+  version: 2026.8.8
   area: Keller
 
   #
   # GPIOs
   #
-  # obsolete if sht3xd
-  PIN_DHT22_IN: GPIO16
-  # obsolete if sht3xd
-  PIN_DHT22_OUT: GPIO17
-  
   PIN_I2C_SDA: GPIO21
   PIN_I2C_SCL: GPIO22
+  
   PIN_RELAIS: GPIO23
+
   PIN_ROTARY_ENCODER_CLK: GPIO25
   PIN_ROTARY_ENCODER_DT: GPIO26
   PIN_ROTARY_ENCODER_SW: GPIO27
@@ -67,30 +64,49 @@ esphome:
       then:
         - switch.turn_off: relais_id
 
-  # priority 800 runs after hardware init but before WiFi/network comes up
   on_boot:
-    priority: 800
-    then:
-      # Light the display for backlight_delay seconds so the user sees the
-      # device boot. The ON/OFF pair is deliberate: ON switches the backlight
-      # on immediately, the following OFF is held back by the delayed_off
-      # filter on backlight_id and only lands once the delay has elapsed.
-      # This "pulse" idiom is reused on every user interaction below.
-      - if:
-          condition:
-            binary_sensor.is_off: backlight_id
-          then:
-            - binary_sensor.template.publish:
-                id: backlight_id
-                state: ON
-            - binary_sensor.template.publish:
-                id: backlight_id
-                state: OFF
-      # seed the system clock from the RTC; without network this is the only
-      # source of time, and the display shows --:-- until it succeeds
-      - ds1307.read_time:
-      # the relais has no restore_mode, so start from a defined off state
-      - switch.turn_off: relais_id
+    # priority 800 runs after hardware init but before WiFi/network comes up
+    - priority: 800
+      then:
+        # Light the display for backlight_delay seconds so the user sees the
+        # device boot - same path every user interaction takes.
+        - script.execute: backlight_wake_script
+        # seed the system clock from the RTC; without network this is the only
+        # source of time, and the display shows --:-- until it succeeds
+        - ds1307.read_time:
+        # the relais has no restore_mode, so start from a defined off state
+        - switch.turn_off: relais_id
+        # Backdate the last-change stamp by a full pause, so the fan may start
+        # on the first control_script tick instead of sitting out MIN_PAUSE.
+        # Must come AFTER the turn_off above: if that one actually switches, its
+        # on_turn_off handler overwrites this with millis().
+        #
+        # Why: fan_last_change_ms_id is restore_value: no and starts at 0, so
+        # right after a boot "millis() - 0" is a few seconds and the pause guard
+        # in control_script blocked every start for MIN_PAUSE_TIME_S. During the
+        # watchdog-reset period that was most of the device's uptime.
+        # The subtraction underflows on purpose - the guard does unsigned
+        # arithmetic too, so the difference comes out correct either way.
+        #
+        # Trade-off, deliberate: after a watchdog reset the fan may restart
+        # roughly a boot-time after it stopped, which is shorter than MIN_PAUSE.
+        # A reboot is rare and the relay contacts survive it; a fan that never
+        # runs does not do its job.
+        - lambda: |-
+            id(fan_last_change_ms_id) = millis() - (${MIN_PAUSE_TIME_S} * 1000UL);
+
+    # Deliberately NOT 800: a restoring global is a component of its own with
+    # setup_priority::HARDWARE, which is the same 800 this trigger would run at,
+    # and equal priorities are resolved by registration order. Incrementing at
+    # 800 would be a race against the load() that reads the stored value - it
+    # could add 1 to the initial 0 and then have the restore overwrite it, so
+    # the count would never grow. 700 is safely after every HARDWARE component
+    # and still long before the network comes up. (The same trap is documented
+    # on backlight_delay_id further down, where the number reads NaN at 800.)
+    - priority: 700
+      then:
+        - lambda: |-
+            id(reset_count_id) += 1;
 
   # priority 700 runs early enough that the relais is still controllable
   on_shutdown:
@@ -141,42 +157,13 @@ wifi:
 captive_portal:
 
 #
-# https://esphome.io/components/http_request
+# https://esphome.io/components/ota
 #
-http_request:
-  verify_ssl: false
-
-#
-# Two OTA paths are configured: http_request pulls a build from the web server
-# (triggered by the "Firmware Update" button), esphome is the classic push from
-# the dashboard. Both share the same handlers, which park the display on
+# One OTA path is configured: esphome is the classic push from
+# the dashboard. It uses the handlers, which park the display on
 # page 100 so the user sees progress on the LCD instead of a frozen screen.
 #
 ota:
-  #
-  # https://esphome.io/components/ota/http_request
-  #
-  - platform: http_request
-    on_state_change:
-      then:
-        - lambda: |-
-            id(ota_state_id) = state;
-            id(page_id) = 100;
-        - component.update: display_id
-    on_progress:
-      then:
-        - lambda: |-
-            id(ota_progress_id) = x;
-            id(display_id)->update();
-            id(page_id) = 100;
-    on_error:
-      then:
-        - switch.turn_off: relais_id
-        - lambda: |-
-            id(ota_state_id) = ota::OTA_ERROR;
-            id(ota_error_id) = x;
-            id(page_id) = 100;
-        - component.update: display_id
 
   #
   # https://esphome.io/components/ota/esphome
@@ -259,7 +246,7 @@ mqtt:
   # ~5min to 18min26s - and then the watchdog fired again after 1min40s. No
   # reliable improvement; kept only because a wider window genuinely lowers the
   # disconnect rate.
-  # Device-side signature: the loop goes silent mid-interval (the DHT poll
+  # Device-side signature: the loop goes silent mid-interval (the sensor poll
   # simply stops) with no mqtt log line before it, then the watchdog, with
   # loopTask starved while both CPUs sit in IDLE.
   # Broker-side the dominant disconnect reason is "has exceeded timeout" (~35 in
@@ -291,6 +278,9 @@ web_server:
 # https://esphome.io/components/time
 #
 time:
+  #
+  # https://esphome.io/components/time/ds1307
+  #
   - platform: ds1307
     id: ds1307_time
     address: 0x68
@@ -301,6 +291,9 @@ time:
     # is much more accurate than the internal clock
     update_interval: never
 
+  #
+  # https://esphome.io/components/time/sntp
+  #
   - platform: sntp
     id: sntp_time
     timezone: Europe/Berlin
@@ -319,7 +312,27 @@ time:
 # https://esphome.io/components/logger
 #
 logger:
-  level: ERROR
+  # WARN, not ERROR. ERROR hid the two things that mattered most while debugging
+  # this device: the i2c "Using max allowed timeout: 13 ms" clamp warning, and
+  # any sht3xd/ds1307 retry warning. It also silences nothing expensive - this
+  # device logs no warnings in normal operation, so the extra level costs
+  # nothing until something is actually wrong.
+  # CONFIG (and with it the i2c bus scan) is still filtered out; raise to DEBUG
+  # temporarily when you need the scan results.
+  level: WARN
+
+#
+# https://esphome.io/components/debug
+#
+# Pulled in for exactly one thing: the reset_reason text sensor below, which
+# names the cause of the last restart ("task watchdog", "interrupt watchdog",
+# "brownout", "software via esp_restart", ...). That is the half of the reset
+# statistics the counter cannot give - the count says how often, this says why.
+# update_interval is long on purpose: the reason cannot change while running,
+# and this device is sensitive to anything that adds work to the main loop.
+#
+debug:
+  update_interval: 300s
 
 ################################################################################
 #
@@ -354,7 +367,7 @@ globals:
     restore_value: no
     initial_value: '0'
 
-  # Set by the interval below when a DHT reports NaN. Read by control_script
+  # Set by the interval below when a SHT31 reports NaN. Read by control_script
   # (which then refuses to regulate) and by the display (error icon, page 2).
   - id: indoor_sensor_error_id
     type: bool
@@ -401,12 +414,34 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  # Number of boots, incremented once per start by the priority-700 on_boot
+  # block. Counts every restart alike - OTA, the Restart button, a power cut and
+  # a watchdog reset are indistinguishable here, which is why the reset REASON
+  # from the debug component sits next to it on display page 4 and in Home
+  # Assistant. A factory reset clears the preference and the count starts at 0.
+  # Only meaningful together with the uptime: a rising count at short uptimes is
+  # the watchdog signature this device has a history of.
+  - id: reset_count_id
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
 #
 # https://esphome.io/components/i2c
 #
 #
-# Shared bus for the LCD (PCF8574 @ 0x27) and the RTC (DS1307 @ 0x68).
-# 100 kHz is the DS1307 maximum, so the bus cannot be clocked faster.
+# Shared bus, four devices:
+#   0x27 LCD (PCF8574)          0x44 SHT31 indoor
+#   0x50 AT24C32 EEPROM         0x45 SHT31 outdoor
+#   0x68 RTC (DS1307)
+# 0x50 is the EEPROM riding along on the DS1307 breakout. Nothing here talks to
+# it, but it is a useful probe when the RTC misbehaves: it shares VCC and both
+# bus lines with the DS1307, so "0x50 answers, 0x68 does not" isolates the fault
+# to the RTC chip itself rather than to power or wiring. To see it, set
+# "scan: True" below and raise the logger to DEBUG - the scan results are logged
+# at CONFIG level and are invisible at the WARN level this device normally runs.
+# 100 kHz is the DS1307 maximum, so the bus cannot be clocked faster. The SHT31s
+# would do 1 MHz and the PCF8574 400 kHz; the RTC is the limit.
 #
 i2c:
   id: i2c_id
@@ -416,14 +451,23 @@ i2c:
   # Maps to scl_wait_us, i.e. the clock-stretching timeout - NOT the transfer
   # timeout, which esphome hardcodes to 100ms in
   # i2c_bus_esp_idf.cpp: i2c_master_execute_defined_operations(..., 100).
-  # Neither the PCF8574 nor the DS1307 stretches the clock, so any bounded value
-  # is functionally safe here; 5ms makes a bus that holds SCL low abort quickly
-  # instead of running into the full 100ms with loopTask blocked.
-  # MEASURED: this does NOT stop the watchdog resets. Tried 2026-08-02, reset
-  # came 5 minutes after boot with the unchanged signature (loopTask starved
-  # while both CPUs sit in IDLE). So the hang is not clock stretching. Kept only
-  # because bounding scl_wait_us is sound on its own; do not expect a fix here.
-  timeout: 5ms
+  # This used to be 5ms, on the (then correct) assumption that no device on this
+  # bus stretches the clock. The SHT31s broke that assumption: sht3xd::setup()
+  # reads the serial number through register 0x3780, which is explicitly the
+  # clock-stretching variant. If the sensor stretches longer than scl_wait_us the
+  # master aborts mid-byte while the sensor still drives SDA, and a bus left in
+  # that state takes every other device with it - the DS1307 included, whose
+  # setup() calls mark_failed() on a single bad read and never retries.
+  # 13ms is the ceiling, and writing it out is deliberate: IDFI2CBus::setup()
+  # clamps anything larger to exactly this value and only says so at warning
+  # level, which the logger used to swallow (it ran at ERROR) -
+  #     if (this->timeout_ > 13000) { ESP_LOGW("Using max allowed timeout: 13ms");
+  #                                   this->timeout_ = 13000; }
+  # so a larger number here would just be a value the device never runs.
+  # MEASURED: bounding this does NOT stop the watchdog resets. Tried 2026-08-02,
+  # reset came 5 minutes after boot with the unchanged signature (loopTask
+  # starved while both CPUs sit in IDLE). Do not expect a fix for that here.
+  timeout: 13ms
   scan: False
 
 #
@@ -533,19 +577,44 @@ script:
   #
   # Apply the datetime helper numbers to the system clock and the RTC
   #
-  # Called when leaving the Date/Time menus.
+  # Called when leaving the Date/Time menus, with a flag for the half that menu
+  # actually edits. Everything else is taken from the clock as it reads right
+  # now, NOT from the helper numbers.
+  #
+  # That distinction is the whole point. The numbers are a snapshot taken by
+  # datetime_load_script when the menu was entered, and the Date menu only ever
+  # edits three of the six. Writing all six back therefore restored the
+  # hour/minute/second from the moment of entry and set the clock BACK by
+  # however long the user spent in the menu - and it did so even when nothing
+  # was edited, because on_leave fires either way.
+  #
+  # now() is the system clock (RealTimeClock::timestamp_now() is ::time(nullptr),
+  # see real_time_clock.h), so reading it here costs nothing on the i2c bus.
   #
   - id: datetime_apply_script
     mode: single
+    parameters:
+      apply_date: bool
+      apply_time: bool
     then:
       - lambda: |-
-          ESPTime t{};
-          t.second = (uint8_t) id(datetime_second_id).state;
-          t.minute = (uint8_t) id(datetime_minute_id).state;
-          t.hour = (uint8_t) id(datetime_hour_id).state;
-          t.day_of_month = (uint8_t) id(datetime_day_id).state;
-          t.month = (uint8_t) id(datetime_month_id).state;
-          t.year = (uint16_t) id(datetime_year_id).state;
+          auto now = id(ds1307_time).now();
+          if (!now.is_valid()) {
+            ESP_LOGE("datetime", "Clock invalid, refusing a partial update");
+            return;
+          }
+
+          ESPTime t = now;
+          if (apply_time) {
+            t.second = (uint8_t) id(datetime_second_id).state;
+            t.minute = (uint8_t) id(datetime_minute_id).state;
+            t.hour = (uint8_t) id(datetime_hour_id).state;
+          }
+          if (apply_date) {
+            t.day_of_month = (uint8_t) id(datetime_day_id).state;
+            t.month = (uint8_t) id(datetime_month_id).state;
+            t.year = (uint16_t) id(datetime_year_id).state;
+          }
 
           // day_of_week and day_of_year are unknown when building from fields,
           // so exclude them from the range check
@@ -568,22 +637,48 @@ script:
 
           id(ds1307_time).write_time();
 
+  #
+  # Wake the display and restart the backlight countdown
+  #
+  # THE single place that arms the backlight timer, called by every input path
+  # (button, both encoder directions, boot). "No input for backlight_delay
+  # seconds" is therefore the one and only condition that darkens the display.
+  #
+  # How the pulse works: ON switches the light on via the on_press trigger of
+  # backlight_id, the immediately following OFF is held back by that sensor's
+  # delayed_off filter and only lands once the delay has elapsed. Calling this
+  # again while an OFF is pending restarts the countdown from zero, because
+  # publish_state() has no deduplication and DelayedOffFilter::new_value(true)
+  # cancels the pending timeout before re-arming it (binary_sensor/filter.cpp).
+  #
+  - id: backlight_wake_script
+    mode: single
+    then:
+      - binary_sensor.template.publish:
+          id: backlight_id
+          state: ON
+      - binary_sensor.template.publish:
+          id: backlight_id
+          state: OFF
+
 #
 # https://esphome.io/components/interval
 #
 interval:
-  # 10s is a good match for the 5s DHT update interval: fast enough for the
-  # error icon on the display, cheap enough to not run on every main loop pass
+  # Three times the 30s sensor interval: fast enough for the error icon on the
+  # display, cheap enough to not run on every main loop pass
   - interval: 10s
     then:
       - lambda: |-
-          // isnan() alone is not enough: a dead DHT22 humidity element still
-          // answers with a valid checksum, it just reports a frozen value. This
+          // isnan() alone is not enough: a humidity element can die while still
+          // answering with a valid checksum, reporting a frozen value. This
           // device ran with a constant 1.0% at plausible temperatures, which the
           // old check waved through - the resulting dew point of -32 C would
           // have kept the fan off forever without ever raising the error icon.
           // The datasheet range (0..100%) cannot catch that; only a bound that
           // comes from the room can.
+          // The isnan() half of the check only works because the sht3xd sensors
+          // carry a "timeout" filter - see the sensor section for why.
           const float indoor_h = id(indoor_humidity_id).state;
           const float indoor_t = id(indoor_temperature_id).state;
           id(indoor_sensor_error_id) = isnan(indoor_h) || isnan(indoor_t) ||
@@ -611,7 +706,7 @@ interval:
 ################################################################################
 
 #
-# https://esphome.io/components/number/index
+# https://esphome.io/components/number
 #
 number:
 
@@ -649,6 +744,10 @@ number:
     name: Indoor temperature minimum
     icon: mdi:thermometer-low
     id: indoor_temperature_min_id
+    # without these the entity is a bare number in Home Assistant; the lcd_menu
+    # ignores both and needs its own value_lambda (see the System menu below)
+    unit_of_measurement: "°C"
+    device_class: temperature
     min_value: 5.0
     max_value: 25.0
     initial_value: 8.0
@@ -663,6 +762,8 @@ number:
     name: Outdoor temperature minimum
     icon: mdi:thermometer-low
     id: outdoor_temperature_min_id
+    unit_of_measurement: "°C"
+    device_class: temperature
     min_value: -30.0
     max_value: 20.0
     initial_value: 5.0
@@ -776,9 +877,25 @@ number:
 ################################################################################
 
 #
-# https://esphome.io/components/text_sensor/index
+# https://esphome.io/components/text_sensor
 #
 text_sensor:
+
+  #
+  # Reset Reason
+  # https://esphome.io/components/text_sensor/debug
+  #
+  # Cause of the last restart, straight from esp_reset_reason(). Read this
+  # together with Reset Count: the count alone cannot tell an OTA apart from a
+  # watchdog, and "task watchdog" at a low uptime is the exact signature this
+  # device has a documented history of (see the mqtt section).
+  #
+  - platform: debug
+    reset_reason:
+      id: reset_reason_id
+      name: Reset Reason
+      icon: mdi:restart-alert
+      entity_category: diagnostic
 
   #
   # Fan state reason
@@ -887,7 +1004,7 @@ text_sensor:
 ################################################################################
 
 #
-# https://esphome.io/components/binary_sensor/index
+# https://esphome.io/components/binary_sensor
 #
 binary_sensor:
 
@@ -910,19 +1027,15 @@ binary_sensor:
     # First press with a dark display only wakes the backlight and is swallowed,
     # so nobody triggers a menu action blindly. Afterwards: open the menu, or
     # confirm the highlighted entry if it is already open.
+    #
+    # Order matters: the action is decided from the backlight state BEFORE this
+    # press re-arms the timer, otherwise the wake-up press would act as well.
     on_press:
       then:
         - if:
             condition:
-              binary_sensor.is_off: backlight_id
+              binary_sensor.is_on: backlight_id
             then:
-              - binary_sensor.template.publish:
-                  id: backlight_id
-                  state: ON
-              - binary_sensor.template.publish:
-                  id: backlight_id
-                  state: OFF
-            else:
               - if:
                   condition:
                     display_menu.is_active:
@@ -930,6 +1043,7 @@ binary_sensor:
                     - display_menu.enter:
                   else:
                     - display_menu.show:
+        - script.execute: backlight_wake_script
 
   #
   # Fan State
@@ -950,17 +1064,23 @@ binary_sensor:
   # Backlight
   # https://esphome.io/components/binary_sensor/template
   #
-  # Not a real sensor but a one-shot timer. Callers publish ON followed
-  # immediately by OFF; the delayed_off filter swallows the OFF for
-  # backlight_delay seconds, so on_press lights the display and on_release
-  # turns it off again once the delay expires.
+  # Not a real sensor but a retriggerable one-shot timer, armed exclusively by
+  # backlight_wake_script: the ON lights the display through on_press, the OFF
+  # that follows is held back by the delayed_off filter and turns it off again
+  # through on_release once backlight_delay has passed with no further input.
+  #
+  # Its state doubles as "is the display currently lit", which every input path
+  # tests to decide whether a press or a turn acts or merely wakes the display.
+  # That only holds because the timer is re-armed on every input - if some input
+  # path forgets to call the script, this sensor goes OFF while the display is
+  # still lit and the next input is silently swallowed.
   #
   - platform: template
     id: backlight_id
     internal: True
-    # defaults to False, and the on_boot pulse below is the very first state
-    # this sensor ever sees -- without this its on_press is swallowed and the
-    # boot pulse would only ever switch the backlight off
+    # defaults to False, and the on_boot wake is the very first state this
+    # sensor ever sees -- without this its on_press is swallowed and the boot
+    # pulse would only ever switch the backlight off
     trigger_on_initial_state: True
     filters:
       # backlight_delay_id is a template number with setup_priority HARDWARE,
@@ -979,12 +1099,16 @@ binary_sensor:
             id(display_id).backlight();
     on_release:
       then:
+        # Unconditional: reaching this means backlight_delay has passed without
+        # a single input. This used to be guarded by !lcd_menu_id.is_active(),
+        # which froze the light on for as long as the menu was open - necessary
+        # back when menu navigation did not re-arm the timer, but it also left
+        # backlight_id OFF while the display was lit, and the next button press
+        # was then swallowed by the "dark display" branch instead of acting.
+        # Now that every input calls backlight_wake_script, the menu keeps
+        # itself lit by being used and the guard is gone.
         - lambda: |-
-            // keep the light on while someone is navigating the menu; the
-            // "Exit Menu" command re-arms the timer with a fresh pulse
-            if (!id(lcd_menu_id).is_active()) {
-              id(display_id).no_backlight();
-            }
+            id(display_id).no_backlight();
 
 ################################################################################
 #
@@ -993,7 +1117,7 @@ binary_sensor:
 ################################################################################
 
 #
-# https://esphome.io/components/select/index
+# https://esphome.io/components/select
 #
 select:
 
@@ -1026,7 +1150,7 @@ select:
 ################################################################################
 
 #
-# https://esphome.io/components/button/index
+# https://esphome.io/components/button
 #
 button:
 
@@ -1057,21 +1181,6 @@ button:
     name: Restart (Safe Mode)
     icon: mdi:reload
 
-  #
-  # Firmware Update
-  #
-  - platform: template
-    id: update_id
-    name: Firmware Update
-    icon: mdi:update
-    device_class: update
-    entity_category: config
-    on_press:
-      then:
-        - ota.http_request.flash:
-            md5_url: "https://homeassistant.carstenwalther.de/local/ota/${project_name}/firmware.md5"
-            url: "https://homeassistant.carstenwalther.de/local/ota/${project_name}/firmware.ota.bin"
-
 ################################################################################
 #
 # Sensors
@@ -1081,16 +1190,24 @@ button:
 #
 # https://esphome.io/components/sensor/index
 #
-# The climate sensors and everything derived from them run at 30s, not the 5s
-# they used to. Two reasons:
-#   - control_script only runs every 10s (see the interval above), so half the
-#     readings were never evaluated by anything.
-#   - the dht driver reads inside an InterruptLock, roughly 4-5ms per sensor with
-#     interrupts disabled. At 5s that is a recurring blackout for the wifi and
-#     i2c ISRs; 30s cuts it by a factor of six. (Moving to an i2c sensor such as
-#     the sht3xd removes the InterruptLock entirely - see the commented blocks.)
+# The climate sensors and everything derived from them run at 30s. Faster buys
+# nothing: control_script only runs every 10s (see the interval above), so the
+# extra readings would never be evaluated, and every poll costs transfers on the
+# same i2c bus the LCD already keeps busy.
 # A cellar is thermally slow; 30s is still far finer than anything the room
 # does. The visible cost is that breathing on a sensor takes up to 30s to show.
+#
+# WHY EVERY SHT31 VALUE CARRIES A "timeout" FILTER
+# The two climate sensors are the only inputs the dew point logic has, so a
+# sensor that stops answering must become visible. It no longer does so by
+# itself: on a failed read the sht3xd driver calls status_set_warning() and
+# returns WITHOUT publishing anything (sht3xd.cpp), so the sensor keeps its last
+# value forever. The dht driver this replaced published NAN instead
+# (dht.cpp: publish_state(NAN)), which is what the isnan() checks in the
+# interval above were written against - unfiltered, they would never fire again
+# and the fan would keep regulating on a frozen reading from a dead sensor.
+# The filter restores that behaviour: no update within 90s (three missed polls)
+# publishes nan, which the interval turns into the sensor error.
 sensor:
 
   #
@@ -1140,7 +1257,8 @@ sensor:
   #
   # CLK/DT need no pin mode here: the KY-040 breakout pulls both up itself.
   # Turning either navigates the menu (when open) or flips the display page.
-  # Like the button, the first turn with a dark display only wakes it.
+  # Like the button, the first turn with a dark display only wakes it - which
+  # now also holds inside the menu, where the old code navigated blind.
   - platform: rotary_encoder
     id: rotary_encoder_id
     name: Rotary Encoder
@@ -1153,22 +1271,17 @@ sensor:
     filters:
       debounce: 30ms
     on_anticlockwise:
+      # same shape as the button: act on the pre-wake backlight state, then
+      # re-arm unconditionally so navigating the menu keeps the light on
       - if:
           condition:
-            display_menu.is_active:
+            binary_sensor.is_on: backlight_id
           then:
-            - display_menu.up:
-          else:
             - if:
                 condition:
-                  binary_sensor.is_off: backlight_id
+                  display_menu.is_active:
                 then:
-                  - binary_sensor.template.publish:
-                      id: backlight_id
-                      state: ON
-                  - binary_sensor.template.publish:
-                      id: backlight_id
-                      state: OFF
+                  - display_menu.up:
                 else:
                   - globals.set:
                       id: page_id
@@ -1176,33 +1289,27 @@ sensor:
                         return id(page_id) -= 1;
                   - if:
                       condition:
-                        # > 3 also catches the OTA page (100), which would
-                        # otherwise take ~97 clicks to leave
+                        # > 4 also catches the OTA page (100), which would
+                        # otherwise take ~96 clicks to leave
                         lambda: |-
-                          return id(page_id) <= 0 || id(page_id) > 3;
+                          return id(page_id) <= 0 || id(page_id) > 4;
                       then:
                         - globals.set:
                             id: page_id
                             value: !lambda |-
                               return 0;
+      - script.execute: backlight_wake_script
 
     on_clockwise:
       - if:
           condition:
-            display_menu.is_active:
+            binary_sensor.is_on: backlight_id
           then:
-            - display_menu.down:
-          else:
             - if:
                 condition:
-                  binary_sensor.is_off: backlight_id
+                  display_menu.is_active:
                 then:
-                  - binary_sensor.template.publish:
-                      id: backlight_id
-                      state: ON
-                  - binary_sensor.template.publish:
-                      id: backlight_id
-                      state: OFF
+                  - display_menu.down:
                 else:
                   - globals.set:
                       id: page_id
@@ -1211,12 +1318,13 @@ sensor:
                   - if:
                       condition:
                         lambda: |-
-                          return id(page_id) >= 3;
+                          return id(page_id) >= 4;
                       then:
                         - globals.set:
                             id: page_id
                             value: !lambda |-
-                              return 3;
+                              return 4;
+      - script.execute: backlight_wake_script
 
   #
   # Delta Dew Point
@@ -1260,6 +1368,25 @@ sensor:
       return id(fan_cycles_id);
 
   #
+  # Reset Count
+  # https://esphome.io/components/sensor/template
+  #
+  # Restarts since the last factory reset, incremented once per boot. Rarely
+  # changes, so a slow update interval is enough - the value it reports is
+  # already final by the time the first update runs.
+  #
+  - platform: template
+    id: reset_count_sensor_id
+    name: Reset Count
+    icon: mdi:restart-alert
+    state_class: total_increasing
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return id(reset_count_id);
+
+  #
   # Delta Dew Point
   # https://esphome.io/components/sensor/template
   #
@@ -1299,40 +1426,26 @@ sensor:
 
   #
   # Outdoor Temperature
-  # https://esphome.io/components/sensor/dht
+  # https://esphome.io/components/sensor/sht3xd
   #
-  - platform: dht
-    pin: ${PIN_DHT22_OUT}
-    model: DHT22
+  - platform: sht3xd
+    address: 0x45          # ADDR-Pin auf VDD
+    update_interval: 30s
     temperature:
       id: outdoor_temperature_id
       name: Outdoor Temperature
       icon: mdi:thermometer
       accuracy_decimals: 1
+      # see "WHY EVERY SHT31 VALUE CARRIES A timeout FILTER" above
       filters:
-        - offset: 0.0
+        - timeout: 90s
     humidity:
       id: outdoor_humidity_id
       name: Outdoor Humidity
       icon: mdi:water-percent
       accuracy_decimals: 1
       filters:
-        - offset: 0.0
-    update_interval: 30s
-# for later use
-#  - platform: sht3xd
-#    address: 0x45          # ADDR-Pin auf VDD
-#    update_interval: 30s
-#    temperature:
-#      id: outdoor_temperature_id
-#      name: Outdoor Temperature
-#      icon: mdi:thermometer
-#      accuracy_decimals: 1
-#    humidity:
-#      id: outdoor_humidity_id
-#      name: Outdoor Humidity
-#      icon: mdi:water-percent
-#      accuracy_decimals: 1
+        - timeout: 90s
 
   #
   # Outdoor Dew Point
@@ -1368,40 +1481,26 @@ sensor:
 
   #
   # Indoor Temperature
-  # https://esphome.io/components/sensor/dht
+  # https://esphome.io/components/sensor/sht3xd
   #
-  - platform: dht
-    pin: ${PIN_DHT22_IN}
-    model: DHT22
+  - platform: sht3xd
+    address: 0x44          # ADDR-Pin auf GND
+    update_interval: 30s
     temperature:
       id: indoor_temperature_id
       name: Indoor Temperature
       icon: mdi:thermometer
       accuracy_decimals: 1
+      # see "WHY EVERY SHT31 VALUE CARRIES A timeout FILTER" above
       filters:
-        - offset: 0.0
+        - timeout: 90s
     humidity:
       id: indoor_humidity_id
       name: Indoor Humidity
       icon: mdi:water-percent
       accuracy_decimals: 1
       filters:
-        - offset: 0.0
-    update_interval: 30s
-# for later use
-#  - platform: sht3xd
-#    address: 0x44          # ADDR-Pin auf GND
-#    update_interval: 30s
-#    temperature:
-#      id: indoor_temperature_id
-#      name: Indoor Temperature
-#      icon: mdi:thermometer
-#      accuracy_decimals: 1
-#    humidity:
-#      id: indoor_humidity_id
-#      name: Indoor Humidity
-#      icon: mdi:water-percent
-#      accuracy_decimals: 1
+        - timeout: 90s
 
   #
   # Indoor Dew Point
@@ -1575,18 +1674,35 @@ lcd_menu:
           text: 'Hysteresis'
           immediate_edit: False
           number: hysteresis_id
-        # format defaults to "%.1f"; these have step 1.0, so the decimal is
-        # never anything but 0 and only wastes display width
+        # These two show the unit, which "format" cannot do: it is validated
+        # against ^%[+-]*(\d+)?(\.\d+)?[fg]$, so any trailing text is rejected,
+        # and MenuItemNumber::get_value_text() never looks at the number's
+        # unit_of_measurement. value_lambda is the only way in. \x01 is the
+        # degree glyph from user_characters, split from the "C" so the compiler
+        # does not read \x01C as one hex escape - same idiom as the display.
+        #
+        # Column budget, from LCDCharacterMenuComponent::draw_item(): the value
+        # is right-aligned as " [value]" ending at column 18, so it starts at
+        # 20 - strlen(value) - 4. "-30\x01C" is 5 wide -> starts at 11, and the
+        # label is cut to 10 characters. Hence the shortened texts: the old
+        # 'Out. temp. min.' was already being clipped to 'Out. temp. m' by the
+        # bare '%.0f' value, only less obviously.
         - type: number
-          text: 'In. temp. min.'
+          text: 'Indoor min'
           immediate_edit: False
           number: indoor_temperature_min_id
-          format: "%.0f"
+          value_lambda: |-
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%.0f\x01" "C", id(indoor_temperature_min_id).state);
+            return std::string(buf);
         - type: number
-          text: 'Out. temp. min.'
+          text: 'Outdoor min'
           immediate_edit: False
           number: outdoor_temperature_min_id
-          format: "%.0f"
+          value_lambda: |-
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%.0f\x01" "C", id(outdoor_temperature_min_id).state);
+            return std::string(buf);
         - type: back
           text: 'Back'
     #
@@ -1604,7 +1720,11 @@ lcd_menu:
               - script.execute: datetime_load_script
           on_leave:
             then:
-              - script.execute: datetime_apply_script
+              # only the calendar half; the time of day keeps running
+              - script.execute:
+                  id: datetime_apply_script
+                  apply_date: true
+                  apply_time: false
           items:
             - type: back
               text: 'Back'
@@ -1632,7 +1752,11 @@ lcd_menu:
               - script.execute: datetime_load_script
           on_leave:
             then:
-              - script.execute: datetime_apply_script
+              # only the clock half; the date is taken from the running clock
+              - script.execute:
+                  id: datetime_apply_script
+                  apply_date: false
+                  apply_time: true
           items:
             - type: back
               text: 'Back'
@@ -1687,15 +1811,9 @@ lcd_menu:
         return "Exit Menu";
       on_value:
         then:
+          # No backlight pulse needed here any more: this runs from inside the
+          # button's on_press, which re-arms the timer on its way out.
           - display_menu.hide:
-          # re-arm the backlight timer: while the menu was open on_release kept
-          # the backlight on, and without a new pulse it would never turn off
-          - binary_sensor.template.publish:
-              id: backlight_id
-              state: ON
-          - binary_sensor.template.publish:
-              id: backlight_id
-              state: OFF
 
 #
 # https://esphome.io/components/display/lcd_display
@@ -1826,12 +1944,14 @@ display:
     #   col 0    5         13    17 18 19
     #       HH:MM           !     % o  ~   <- time, error, fan, mqtt, wifi
     #                                          (icons cluster on the right)
-    #       <-- indoor --><-- outdoor -->  <- page 1: cols 0..8 / 9..17
+    #       I<- indoor ->  O<- outdoor ->  <- page 1: cols 0..8 / 11..19
     #
     # Pages reachable by turning the encoder: 0 decision (delta vs. setpoint
-    # and the reason), 1 measurements, 2 wifi, 3 faults. Page 0 is where the
-    # device sits by default, because it answers the question the device exists
-    # for; the raw measurements are one click away.
+    # and the reason), 1 measurements, 2 faults, 3 wifi, 4 reset statistics.
+    # Page 0 is where the device sits by default, because it answers the
+    # question the device exists for; the raw measurements are one click away.
+    # The encoder clamps at 0 and 4 - keep both bounds in the rotary_encoder
+    # handlers in step with this list when adding a page.
     # Page 100 is OTA and is only entered by the update handlers.
     #
     # When the menu is open it owns the whole display and nothing else is drawn.
@@ -1853,40 +1973,35 @@ display:
             it.printf(0, 3, "%s", id(fan_reason_text_id).state.c_str());
             break;
 
-          // Measurements: indoor values in the left column, outdoor in the
-          // right. "%7.1f\x01" "C" is split so the compiler does not read \x01C
-          // as a single hex escape; \x01 is the degree glyph.
+          // Measurements: indoor in the left column, outdoor in the right, one
+          // quantity per row (temperature, humidity, dew point).
+          //
+          // Each value carries an "I"/"O" prefix. Without it the page was four
+          // unlabelled numbers - the row tells you the quantity, but nothing
+          // said which column was which, and there is no spare row for a header
+          // because row 0 belongs to the status bar.
+          // Budget per block: prefix + %6.1f + two more characters = 9 columns,
+          // so 0..8 and 11..19 with a two-column gap. %6.1f is wide enough for
+          // every value that can occur here (-30.0 and 100.0 are five).
+          // "%6.1f\x01" "C" is split so the compiler does not read \x01C as a
+          // single hex escape; \x01 is the degree glyph.
           case 1:
             // Temperatures
-            it.printf(0, 1, "%7.1f\x01" "C", id(indoor_temperature_id).state);
-            it.printf(9, 1, "%7.1f\x01" "C", id(outdoor_temperature_id).state);
+            it.printf(0, 1, "I%6.1f\x01" "C", id(indoor_temperature_id).state);
+            it.printf(11, 1, "O%6.1f\x01" "C", id(outdoor_temperature_id).state);
 
             // Humidities
-            it.printf(0, 2, "%7.1f %%", id(indoor_humidity_id).state);
-            it.printf(9, 2, "%7.1f %%", id(outdoor_humidity_id).state);
+            it.printf(0, 2, "I%6.1f %%", id(indoor_humidity_id).state);
+            it.printf(11, 2, "O%6.1f %%", id(outdoor_humidity_id).state);
 
             // Dewpoints
-            it.printf(0, 3, "%7.1f\x01" "C", id(indoor_dew_point_id).state);
-            it.printf(9, 3, "%7.1f\x01" "C", id(outdoor_dew_point_id).state);
-            break;
-
-          // WiFi Info
-          case 2:
-            if (id(wifi_id).is_disabled()) {
-              it.print(0, 2, "    WiFi disabled");
-            } else {
-              if (id(wifi_id).is_connected()) {
-                it.printf(0, 1, "IP: %16s", id(ip_address_id).state.c_str());
-                it.printf(0, 2, "Signal: %11.1f%%", id(wifi_signal_percent).state);
-              } else {
-                it.print(0, 2, "   WiFi connecting");
-              }
-            }
+            it.printf(0, 3, "I%6.1f\x01" "C", id(indoor_dew_point_id).state);
+            it.printf(11, 3, "O%6.1f\x01" "C", id(outdoor_dew_point_id).state);
             break;
 
           // Sensor missing. The outdoor line moves down to row 3 when the
           // indoor line already occupies row 2, so both can be shown at once.
-          case 3:
+          case 2:
             if(!id(outdoor_sensor_error_id) && !id(indoor_sensor_error_id)) {
               it.print(0, 2, "   System is fine!");
             } else {
@@ -1902,6 +2017,32 @@ display:
                 }
               }
             }
+            break;
+
+          // WiFi Info
+          case 3:
+            if (id(wifi_id).is_disabled()) {
+              it.print(0, 2, "    WiFi disabled");
+            } else {
+              if (id(wifi_id).is_connected()) {
+                it.printf(0, 1, "IP: %16s", id(ip_address_id).state.c_str());
+                it.printf(0, 2, "Signal: %11.1f%%", id(wifi_signal_percent).state);
+              } else {
+                it.print(0, 2, "   WiFi connecting");
+              }
+            }
+            break;
+
+          // Reset statistics. Count and cause belong together: the count says
+          // how often the device restarted, the reason says what did it, and a
+          // high count at a short uptime is the watchdog signature.
+          // The reason gets a row of its own because the strings in
+          // debug_esp32.cpp run up to 24 characters ("software via esp_restart")
+          // and the field is bounded to the 20 the display has.
+          case 4:
+            it.printf(0, 1, "Resets: %11u", (unsigned) id(reset_count_id));
+            it.print(0, 2, "Last cause:");
+            it.printf(0, 3, "%-20.20s", id(reset_reason_id).state.c_str());
             break;
 
           // OTA. Reached only via the OTA handlers, never by turning the
