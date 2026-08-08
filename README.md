@@ -14,7 +14,6 @@ optional conveniences, not requirements.
 ## Table of contents
 
 - [How it works](#how-it-works)
-- [Why the fan is doing what it does](#why-the-fan-is-doing-what-it-does)
 - [Hardware](#hardware)
 - [Pinout](#pinout)
 - [Display](#display)
