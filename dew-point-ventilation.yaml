@@ -74,7 +74,10 @@ esphome:
         # seed the system clock from the RTC; without network this is the only
         # source of time, and the display shows --:-- until it succeeds
         - ds1307.read_time:
-        # the relais has no restore_mode, so start from a defined off state
+        # Belt and braces. The relais already lands off on its own - no
+        # restore_mode is configured, so it takes the schema default ALWAYS_OFF -
+        # but the fan must never come up energised, and that is worth stating
+        # rather than inheriting silently.
         - switch.turn_off: relais_id
         # Backdate the last-change stamp by a full pause, so the fan may start
         # on the first control_script tick instead of sitting out MIN_PAUSE.
@@ -214,33 +217,57 @@ mqtt:
   password: !secret mqtt_password
   # same reasoning as for the api above
   reboot_timeout: 0s
-  # Off at boot: every mqtt reconnect blocks loopTask long enough for the 5s
-  # task watchdog to reboot the device. Everything needed to regulate works
-  # without mqtt, so it stays off until asked for via the "MQTT" entry in the
-  # LCD menu (switch mqtt_state_id).
+  # RESOLVED: the watchdog resets came from the broker and were fixed on the
+  # server side. The history below is kept as the record of what was ruled out -
+  # if the resets ever return, it says which knobs have already been tried.
   #
-  # ROOT CAUSE, established 2026-08-02: the broker runs on THIS network but is
-  # addressed by its public DynDNS name, so every packet takes the path
-  # device -> router -> NAT -> back into the LAN. Three facts pin it down:
+  # Off at boot stays the default anyway, by choice rather than by necessity.
+  # Everything needed to regulate works without mqtt, so the device comes up in
+  # the cheapest possible state and mqtt is switched on when wanted, from the
+  # "MQTT" entry in the LCD menu or from Home Assistant (switch mqtt_state_id).
+  # That switch's restore_mode has to stay in step with the value below - see
+  # the comment there for why a mismatch silently overrides this line.
+  #
+  # HISTORY. Every mqtt reconnect used to block loopTask long enough for the 5s
+  # task watchdog to reboot the device, so mqtt was off at boot and had to be
+  # switched on by hand from the LCD menu. Measured back then:
+  #   discovery on         -> watchdog reset every 2.5-5 minutes
+  #   discovery off        -> one reset ~5 min after boot, then stable
+  #   start delayed by 90s -> no effect, reset ~1 min after mqtt connected
+  #   keepalive 60s        -> 18 min, then 1 min 40 s; no reliable improvement
+  #   mqtt off entirely    -> 50+ minutes clean
+  # Device-side signature: the loop went silent mid-interval (the sensor poll
+  # simply stopped) with no mqtt log line before it, then the watchdog, with
+  # loopTask starved while both CPUs sat in IDLE.
+  #
+  # Investigated and NOT the cause, kept so nobody re-runs it: the broker is on
+  # THIS network but addressed by its public DynDNS name, so every packet took
+  # the path device -> router -> NAT -> back into the LAN.
   #   mqtt.carstenwalther.de -> mqtt-walther.dynv6.net -> 92.206.232.135
   #   public IP of the network this device sits in     -> 92.206.232.135
   #   source address Mosquitto logs for this device    -> 92.206.232.135
-  # The broker seeing the WAN address instead of a LAN one proves the router is
-  # source-NATing its own hairpin. Consumer routers do this badly: small NAT
-  # tables, aggressive idle timeouts, least reliable path in the house.
+  # The broker seeing the WAN address proves the router source-NATs its own
+  # hairpin, which consumer routers do badly. Addressing the broker by its LAN
+  # IP is still the better choice, but it was not what fixed this.
   #
-  # THE FIX is to point mqtt_broker at the broker's LAN IP. Everything below is
-  # mitigation that was measured and found insufficient - do not mistake any of
-  # it for a solution.
+  # Also NOT the cause: a duplicate client_id. Every "already connected, closing
+  # old connection" in the broker log came from the same source address and was
+  # immediately followed by the same client reconnecting - this device racing
+  # its own stale session after a silent drop, not a second client. ESPHome
+  # builds the id as device name + full MAC (dew-point-ventilation-ec64c98652d0),
+  # which does not collide by accident. The "truncated to 23 characters" comment
+  # in mqtt_client.h is stale; the buffer is MAX_NAME_WITH_SUFFIX_SIZE = 128.
+  #
+  # WATCH loop_time (sensor platform debug, further down) whenever mqtt is on.
+  # It is the direct measurement of the thing that used to fail here, and the
+  # whole table above was assembled without it.
   enable_on_boot: False
 
-  # MEASURED: with discovery on, watchdog reset every 2.5-5 minutes; mqtt off
-  # entirely gave 50+ minutes clean. ESPHome republishes the discovery payload
-  # for all ~50 entities on every reconnect, and those bursts blocked loopTask
-  # for 1.2-1.5s at a time (api was seen at 2163ms).
-  # Discovery messages are retained, so entities already known to Home Assistant
-  # survive this being off. Turn it back on briefly if you ever add entities.
-  discovery: False
+  # Back on: discovery bursts republish all ~50 entities on every reconnect and
+  # used to block loopTask for 1.2-1.5s at a time, but that was a symptom of the
+  # reconnect storm, not a cost worth avoiding on a stable connection. With it
+  # off, newly added entities never reach Home Assistant on their own.
+  discovery: True
 
   # Default is 15s. MEASURED: raising it moved the mean time between resets from
   # ~5min to 18min26s - and then the watchdog fired again after 1min40s. No
@@ -716,6 +743,11 @@ number:
   - platform: template
     name: Minimum dew point difference
     id: dew_point_difference_min_id
+    # temperature_delta, not temperature: this is a difference between two dew
+    # points, not a reading. Home Assistant converts the two device classes
+    # differently, and only the delta form is correct for a span.
+    unit_of_measurement: "°C"
+    device_class: temperature_delta
     min_value: 1.0
     max_value: 9.0
     initial_value: 5.0
@@ -730,6 +762,9 @@ number:
     name: Hysteresis
     icon: mdi:chart-bell-curve-cumulative
     id: hysteresis_id
+    # also a span, not a reading - see the dew point difference above
+    unit_of_measurement: "°C"
+    device_class: temperature_delta
     min_value: 0.0
     max_value: 5.0
     initial_value: 1.0
@@ -953,7 +988,19 @@ text_sensor:
     entity_category: diagnostic
     device_class: ""
     lambda: |-
-          int seconds = (id(uptime_seconds_id).state);
+          // The uptime sensor only publishes from update(), so its state is NaN
+          // until the first poll. Test that BEFORE the cast: converting a NaN
+          // float to int is undefined behaviour, and the guard this replaces
+          // ("days > 3650") assumed the cast would yield a huge positive value.
+          // It generally does not, so the fallback below never actually fired
+          // and the first minute showed whatever the conversion happened to
+          // produce.
+          const float uptime = id(uptime_seconds_id).state;
+          if (std::isnan(uptime)) {
+            return {"Starting up"};
+          }
+
+          int seconds = (int) uptime;
           int days = seconds / (24 * 3600);
 
           seconds = seconds % (24 * 3600);
@@ -963,11 +1010,6 @@ text_sensor:
 
           int minutes = seconds /  60;
           seconds = seconds % 60;
-
-          // an implausibly large uptime means the sensor has no reading yet
-          if (days > 3650) {
-            return {"Starting up"};
-          }
 
           char buf[32];
           if (days) {
@@ -1368,6 +1410,32 @@ sensor:
       return id(fan_cycles_id);
 
   #
+  # Runtime health
+  # https://esphome.io/components/sensor/debug
+  #
+  # loop_time is the reason this block exists: it measures how long the main
+  # loop takes, which is exactly what failed during the watchdog-reset period -
+  # loopTask starved while both CPUs sat in IDLE. A trend line beats the
+  # after-the-fact guessing the mqtt comments above are full of, and it is the
+  # measurement to watch now that mqtt is enabled at boot again.
+  # The heap sensors come along nearly free and would catch the other classic
+  # cause of late resets, a slow leak or a fragmenting heap.
+  # All of these inherit entity_category: diagnostic from the platform schema
+  # and are published on the debug component's 300s interval.
+  #
+  - platform: debug
+    loop_time:
+      id: loop_time_id
+      name: Loop Time
+      icon: mdi:timer-sync-outline
+    free:
+      name: Heap Free
+      icon: mdi:memory
+    fragmentation:
+      name: Heap Fragmentation
+      icon: mdi:memory
+
+  #
   # Reset Count
   # https://esphome.io/components/sensor/template
   #
@@ -1449,22 +1517,29 @@ sensor:
 
   #
   # Outdoor Dew Point
-  # https://esphome.io/components/sensor/template
+  # https://esphome.io/components/sensor/dew_point
   #
-  - platform: template
+  # Was a template sensor with a hand-written Magnus formula. The platform is
+  # better on two counts:
+  #   - It is callback-driven (add_on_state_callback on both sources), so it
+  #     recomputes the moment a reading arrives. The template version polled on
+  #     its own 30s clock, independent of the sensors' 30s clock, so the value
+  #     control_script reads could be a full extra interval behind.
+  #   - It publishes NAN when a source is NaN or the humidity is outside
+  #     (0, 100]. The old lambda clamped RH to 0.1% instead, which turned a
+  #     0% reading into a plausible-looking dew point near -60 C.
+  # Note the constants differ slightly: the platform uses a=17.625 / b=243.04
+  # (Alduchov-Eskridge), the old lambda 17.67 / 243.5. Under 0.1 C apart in this
+  # range - invisible against a threshold adjustable in 0.5 C steps.
+  # unit, device_class and state_class come from the platform schema.
+  #
+  - platform: dew_point
     id: outdoor_dew_point_id
     name: Outdoor Dew Point
     icon: mdi:thermometer-alert
-    unit_of_measurement: °C
-    device_class: temperature
+    temperature: outdoor_temperature_id
+    humidity: outdoor_humidity_id
     accuracy_decimals: 1
-    update_interval: 30s
-    lambda: |-
-      // Magnus formula; clamp the humidity so log() never sees zero
-      const float rh = std::max(id(outdoor_humidity_id).state, 0.1f);
-      const float t = id(outdoor_temperature_id).state;
-      const float gamma = log(rh / 100.0f) + ((17.67f * t) / (243.5f + t));
-      return (243.5f * gamma) / (17.67f - gamma);
 
   #
   # Outdoor Absolute Humidity
@@ -1504,22 +1579,16 @@ sensor:
 
   #
   # Indoor Dew Point
-  # https://esphome.io/components/sensor/template
+  # https://esphome.io/components/sensor/dew_point
   #
-  - platform: template
+  # see the outdoor dew point above for why this is a platform, not a lambda
+  - platform: dew_point
     id: indoor_dew_point_id
     name: Indoor Dew Point
     icon: mdi:thermometer-alert
-    unit_of_measurement: °C
-    device_class: temperature
+    temperature: indoor_temperature_id
+    humidity: indoor_humidity_id
     accuracy_decimals: 1
-    update_interval: 30s
-    lambda: |-
-      // Magnus formula; clamp the humidity so log() never sees zero
-      const float rh = std::max(id(indoor_humidity_id).state, 0.1f);
-      const float t = id(indoor_temperature_id).state;
-      const float gamma = log(rh / 100.0f) + ((17.67f * t) / (243.5f + t));
-      return (243.5f * gamma) / (17.67f - gamma);
 
   #
   # Indoor Absolute Humidity
@@ -1553,6 +1622,11 @@ switch:
   # and a second writer from Home Assistant would be overridden on the next
   # interval tick. The read-only fan_state_id binary sensor mirrors it for HA;
   # to control the fan from outside, set mode_id instead.
+  #
+  # No restore_mode, i.e. the schema default ALWAYS_OFF, which is the one we
+  # want: the fan starts off and control_script decides from there. All three
+  # switches in this file depend on that default doing something, so it is worth
+  # knowing what it is - see the WiFi switch below for the full mechanism.
   - platform: gpio
     id: relais_id
     name: Fan
@@ -1585,12 +1659,36 @@ switch:
   # device. The lambda reports the real radio state, so the switch stays
   # correct even if WiFi is toggled from somewhere else.
   #
+  # restore_mode: DISABLED - the one mode that makes setup() do nothing at all.
+  # It has to be spelled out because the schema default is ALWAYS_OFF, and a
+  # template switch does not merely publish its restored state, it acts on it:
+  #
+  #   if (initial_state.value()) { this->turn_on(); } else { this->turn_off(); }
+  #
+  # So the default had this switch fire turn_off_action - a full wifi.disable()
+  # with wifi_disconnect_() and wifi_mode_(false, false) - on every single boot.
+  # And it ran early: a template switch sets up at HARDWARE - 2 (798), while
+  # WiFiComponent::setup() runs at priority WIFI (250), so the teardown hit a
+  # stack that had not been initialised yet.
+  #
+  # Nothing visibly broke, which is why it survived so long: WiFiComponent::setup()
+  # checks enable_on_boot_ afterwards and starts the radio regardless, and the
+  # lambda below then reports the true state, so the switch corrects itself.
+  # DISABLED simply removes the pointless round trip.
+  #
+  # Restoring a state would be wrong here in any case. This switch has a lambda,
+  # i.e. it mirrors the radio rather than owning it, so there is nothing to
+  # restore - the answer is whatever WiFiComponent is currently doing. Contrast
+  # the MQTT switch below, which has no getter worth polling and therefore does
+  # have to carry a restore_mode that matches its component's enable_on_boot.
+  #
   - platform: template
     id: wifi_state_id
     name: "WiFi"
     icon: "mdi:wifi"
     internal: False
     optimistic: True
+    restore_mode: DISABLED
     lambda: |-
       if (!id(wifi_id).is_disabled()) {
         return true;
@@ -1608,13 +1706,18 @@ switch:
   # MQTT
   # https://esphome.io/components/switch/template
   #
-  # mqtt starts disabled (enable_on_boot: False above); this is the way to turn
-  # it on. Deliberately NOT mirroring the real state with a lambda the way the
-  # WiFi switch does: the only getter available is is_connected(), so the switch
-  # would snap back to off whenever the broker is unreachable - which is exactly
-  # the situation here - and look broken.
-  # ALWAYS_OFF is on purpose: after a watchdog reset the device must come back
-  # in the state known to be stable, not the one that caused the reset.
+  # Lets the user take mqtt down from the LCD menu without reflashing.
+  # Deliberately NOT mirroring the real state with a lambda the way the WiFi
+  # switch does: the only getter available is is_connected(), so the switch
+  # would snap back to off whenever the broker is briefly unreachable and look
+  # broken.
+  #
+  # ALWAYS_OFF has to track "enable_on_boot: False" in the mqtt block, and the
+  # coupling is not cosmetic: TemplateSwitch::setup() acts on the restored state
+  # rather than just publishing it. It calls turn_on()/turn_off() outright,
+  # firing the actions below - so a mismatch here silently overrides
+  # enable_on_boot a moment after boot, and the config validates happily while
+  # doing it. Change one, change the other.
   #
   - platform: template
     id: mqtt_state_id

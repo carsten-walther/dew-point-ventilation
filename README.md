@@ -40,16 +40,28 @@ for deciding whether ventilating dries the room out or wets it further.
 
 ### Dew point calculation
 
-Both dew points are derived from temperature and relative humidity using the
-Magnus formula:
+Both dew points are derived from temperature and relative humidity by ESPHome's
+`dew_point` platform, using the Magnus formula with the Alduchov–Eskridge
+coefficients:
 
 ```
-gamma = ln(RH / 100) + (17.67 · T) / (243.5 + T)
-Td    = (243.5 · gamma) / (17.67 − gamma)
+alpha = ln(RH / 100) + (17.625 · T) / (243.04 + T)
+Td    = (243.04 · alpha) / (17.625 − alpha)
 ```
 
-The relative humidity is clamped to a minimum of 0.1 % so `log()` never receives
-zero.
+The platform publishes `NaN` when either input is `NaN` or the humidity falls
+outside (0, 100] — it never substitutes a value.
+
+> This used to be a hand-written template sensor with the Magnus–Tetens
+> coefficients (17.67 / 243.5) and a clamp of the humidity to a minimum of 0.1 %.
+> The clamp turned a 0 % reading into a plausible-looking dew point near −60 °C
+> instead of an error. The two coefficient sets differ by less than 0.1 °C in
+> this range, which is invisible against a threshold adjustable in 0.5 °C steps.
+>
+> The platform is also **callback-driven**: it recomputes the moment either
+> source publishes. The template version polled on its own 30 s clock,
+> independent of the sensors' 30 s clock, so the dew point the control loop read
+> could be a full extra interval behind the measurement it came from.
 
 ### Control algorithm
 
@@ -347,10 +359,15 @@ update against an invalid clock.
 All settings survive a restart. The date/time helper values are scratch values
 and are not persisted.
 
-The two temperature minimums are declared with `device_class: temperature` and
-`unit_of_measurement: °C`, so Home Assistant renders them as temperatures rather
-than bare numbers. The LCD menu ignores both and needs its own `value_lambda` —
-see [Menu](#menu).
+The first four carry a unit, but not the same device class. The two temperature
+minimums are readings (`device_class: temperature`); the dew point difference and
+the hysteresis are *spans* between two temperatures and use
+`device_class: temperature_delta`. Home Assistant converts the two differently,
+and only the delta form is correct for a difference. The LCD menu ignores both
+fields and needs its own `value_lambda` — see [Menu](#menu).
+
+*Backlight delay* is `internal: True` and therefore never reaches Home Assistant
+at all — it is an LCD-only setting and carries no unit.
 
 ### Compile-time constants
 
@@ -391,10 +408,20 @@ Exposed entities:
   `power-on event`, `software via esp_restart`, `task watchdog`,
   `interrupt watchdog`, `brownout`, …
 
-Read the last two together, and against the uptime. The count alone cannot tell
-an OTA apart from a crash; a rising count at short uptimes with
+- `Loop Time` (ms) — how long the main loop takes
+- `Heap Free` (bytes) and `Heap Fragmentation` (%)
+
+Read `Reset Count` and `Reset Reason` together, and against the uptime. The count
+alone cannot tell an OTA apart from a crash; a rising count at short uptimes with
 `task watchdog` as the cause is the signature this device has a documented
 history of (see [Networking](#networking)). Both are also on display page 4.
+
+`Loop Time` is the direct measurement of what actually failed during that
+period — the main loop stalled while both CPUs sat in IDLE. The whole
+measurement table in [Networking](#networking) was assembled without it, by
+inference from reset timings. Watch it whenever MQTT is switched on. The two heap
+sensors come along nearly free and would catch the other classic cause of late
+resets, a slow leak or a fragmenting heap.
 
 Runtime and cycle count survive a restart. A power cut loses whatever run was in
 progress, because the preference is only written periodically. A factory reset
@@ -406,9 +433,9 @@ clears all of them, including the reset count.
 - Select: `Mode` — Automatic / On / Off
 - Numbers: the four control settings above
 - Switches: `WiFi`, `MQTT`
-- Buttons: `Restart`, `Restart (Safe Mode)`, `Factory Reset`, `Firmware Update`
-- Text sensors: `ESPHome Version`, `Firmware Version`, `Device Uptime`, `SSID`,
-  `IP Address`, `DNS Address`
+- Buttons: `Restart`, `Restart (Safe Mode)`, `Factory Reset`
+- Text sensors: `ESPHome Version`, `Firmware Version`, `Device Uptime`,
+  `Reset Reason`, `SSID`, `IP Address`, `DNS Address`
 
 The relay itself is **internal on purpose**. `control_script` owns it, and a
 second writer from Home Assistant would simply be overridden on the next
@@ -422,11 +449,33 @@ interval tick. To control the fan from outside, set `Mode` instead.
 
 `enable_on_boot: False` is set for MQTT, and the switch uses
 `restore_mode: ALWAYS_OFF`. MQTT must be switched on explicitly, either from the
-LCD menu (*System → MQTT*) or via Home Assistant.
+LCD menu (*System → MQTT*) or via Home Assistant. Everything needed to regulate
+works without it, so the device comes up in the cheapest possible state.
 
-This is not a preference, it is the outcome of a measurement. Every time the MQTT
-connection drops, the reconnect blocks ESPHome's main loop long enough for the
-5 s task watchdog to reboot the device. Observed behaviour:
+> ⚠️ **Those two settings must be changed together.** `TemplateSwitch::setup()`
+> does not merely publish the restored state, it *acts* on it — calling
+> `turn_on()` or `turn_off()`, which fires the switch's action. A switch left at
+> `ALWAYS_OFF` therefore runs `mqtt.disable` moments after `enable_on_boot: True`
+> brought the client up, and vice versa. The config validates either way; the
+> only symptom is MQTT quietly not being in the state you configured.
+>
+> The same mechanism applies to the **WiFi** switch, which is why it is declared
+> `restore_mode: DISABLED`. The schema default is `ALWAYS_OFF`, so without it the
+> switch fired a full `wifi.disable()` on every boot — and early, at setup
+> priority `HARDWARE - 2` (798) against a WiFi stack that only initialises at
+> priority `WIFI` (250). Nothing visibly broke, because `WiFiComponent::setup()`
+> then honours `enable_on_boot` and starts the radio anyway, but the round trip
+> was pointless. That switch mirrors the radio through a lambda rather than
+> owning it, so there is no state worth restoring in the first place.
+
+`discovery: True` is set. Discovery messages are retained, so entities Home
+Assistant already knows survive without it — but newly added entities never
+arrive on their own while it is off.
+
+The rest of this section is history. The resets described below were traced to
+the broker and fixed there; the settings above are now a preference rather than a
+workaround. Every time the MQTT connection dropped, the reconnect blocked
+ESPHome's main loop long enough for the 5 s task watchdog to reboot the device:
 
 | Configuration | Result |
 |---------------|--------|
@@ -472,11 +521,11 @@ is still the better addressing choice — no hairpin, no NAT table, no dependenc
 on external DNS. It was **not** what resolved the resets, though, so the hairpin
 path is documented here as background rather than as the answer.
 
-`ALWAYS_OFF` is deliberate: after a watchdog reset the device must come back in
-the state known to be stable, not the one that caused the reset. Now that the
-broker side is fixed, `enable_on_boot: True` and `discovery: True` are worth
-re-testing — the measurements above were all taken against the broken broker and
-say nothing about how the device behaves against a healthy one.
+Note that the measurements above were all taken against the broken broker, and
+say nothing about how the device behaves against a healthy one. `discovery` has
+since been switched back on without issue. If MQTT is ever enabled at boot as
+well, watch the `Loop Time` sensor — it measures the exact failure mode that
+produced this table, and none of these rows had it available.
 
 > **Not the cause: a duplicate `client_id`.** The broker log does contain
 > `already connected, closing old connection`, but every occurrence comes from
@@ -592,9 +641,11 @@ The I²C bus scan is logged at `CONFIG` level and is therefore *still* invisible
 Raise the logger to `DEBUG` and set `scan: True` when you need it — that is how
 you check which of the five addresses actually answer.
 
-The firmware can also be updated from the device itself via the *Firmware Update*
-button, which pulls a build over HTTP. During any update the display switches to
-page 100 and forces the backlight on, so progress stays visible.
+Only the `esphome` OTA platform is configured — the classic push from the
+dashboard. (An `http_request` OTA path with a *Firmware Update* button, which
+pulled a build from a web server, existed earlier and has been removed.) During
+an update the display switches to page 100 and forces the backlight on, so
+progress stays visible regardless of the backlight timer.
 
 ### Framework
 
@@ -621,6 +672,22 @@ keeps busy. (The original reason was the DHT driver's interrupt-locked read; tha
 cost is gone with the SHT31s, but the interval is still right.) A cellar is
 thermally slow; 30 s is still far finer than anything the room does. The visible
 cost is that breathing on a sensor takes up to 30 s to register.
+
+**Setup priority is a real hazard in `on_boot`.** Components at the same priority
+are set up in registration order, so an `on_boot` block races anything declared
+at its own level. This config has been bitten twice:
+
+- A **restoring global** is a component with `setup_priority::HARDWARE` (800). The
+  reset counter is therefore incremented from a *second* `on_boot` block at
+  priority **700**. At 800 it would race the `load()` that reads the stored
+  value — add 1 to the initial 0, then have the restore overwrite it, and the
+  count would never grow.
+- `backlight_delay_id` is a template number, also at 800, registered after the
+  `on_boot` trigger. Its state is still `NaN` during the boot backlight pulse,
+  which is why the `delayed_off` filter falls back to a hard-coded default
+  instead of casting `NaN` to `uint32_t`.
+
+When adding anything to `on_boot` that reads restored state, put it below 800.
 
 **CGRAM is full.** All eight user character slots are in use: degrees, fan rotor,
 no-signal, signal, attention, MQTT connected, MQTT disconnected, and the menu's
