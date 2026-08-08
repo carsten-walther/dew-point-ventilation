@@ -300,6 +300,21 @@ web_server:
   port: 80
   version: 3
   local: True
+  # Every other channel into this device is authenticated - api has an
+  # encryption key, ota a password, mqtt credentials, the fallback AP a
+  # password. Without this block the web UI was the one open door, and it is
+  # not read-only: it can switch the fan, rewrite every setpoint, restart the
+  # device and press Factory Reset, which wipes the settings along with the
+  # runtime, cycle and reset counters.
+  #
+  # type: digest is set explicitly rather than left to the default. ESPHome
+  # currently defaults to basic, which puts the password on the wire in an
+  # easily reversible form, and warns at validation time that the default flips
+  # to digest in 2027.1.0. Naming it now is both safer and immune to that change.
+  auth:
+    type: digest
+    username: !secret web_username
+    password: !secret web_password
 
 #
 # https://esphome.io/components/time
@@ -1209,10 +1224,24 @@ button:
   # Factory Reset
   # https://esphome.io/components/button/factory_reset
   #
+  # internal: True keeps the single most destructive action in this config off
+  # every remote surface - Home Assistant, MQTT (which publishes it now that
+  # discovery is on) and the web UI. It wipes all preferences: the setpoints,
+  # the fan runtime and cycle counters, and the reset count.
+  #
+  # It stays reachable from the LCD menu: internal only controls whether an
+  # entity is exposed to frontends, the object still exists and the menu's
+  # "button.press: factoryreset_id" works unchanged. Someone has to stand at the
+  # device to trigger it, which is the right bar for this one.
+  #
+  # Note the menu entry fires on a single press with no confirmation step. That
+  # is a misclick away on a rotary encoder; a confirm submenu would be the fix
+  # if it ever actually happens.
   - platform: factory_reset
     id: factoryreset_id
     name: Factory Reset
     icon: mdi:restart
+    internal: True
 
   #
   # Save Mode
@@ -1417,7 +1446,14 @@ sensor:
   # loop takes, which is exactly what failed during the watchdog-reset period -
   # loopTask starved while both CPUs sat in IDLE. A trend line beats the
   # after-the-fact guessing the mqtt comments above are full of, and it is the
-  # measurement to watch now that mqtt is enabled at boot again.
+  # measurement to watch whenever mqtt is switched on.
+  #
+  # It is a MAXIMUM, not a sample. DebugComponent::loop() keeps a running
+  # max_loop_time_ and update() publishes it and resets it to zero, so each
+  # reading is the worst single iteration since the previous one. A long
+  # interval therefore never misses a spike, it only coarsens when the spike
+  # happened - drop the debug component's update_interval temporarily if a
+  # value needs to be tied to a specific event.
   # The heap sensors come along nearly free and would catch the other classic
   # cause of late resets, a slow leak or a fragmenting heap.
   # All of these inherit entity_category: diagnostic from the platform schema
@@ -1463,14 +1499,21 @@ sensor:
   # compares against dew_point_difference_min; published for observability
   # only, the script recomputes it to stay independent of this sensor's cycle.
   #
+  # "never" plus a component.update from both sources, rather than a poll: the
+  # dew point sensors publish the instant a measurement arrives, so a 30s poll
+  # here would have this difference lagging its own inputs by up to a full
+  # interval. temperature_delta rather than temperature - it is a span between
+  # two dew points, matching dew_point_difference_min_id.
+  # Recomputing twice when both sources update back to back is harmless; the
+  # second pass produces the value that stands.
   - platform: template
     id: delta_dew_point_id
     name: Delta Dew Point
     icon: mdi:thermometer-alert
     unit_of_measurement: °C
-    device_class: temperature
+    device_class: temperature_delta
     accuracy_decimals: 1
-    update_interval: 30s
+    update_interval: never
     lambda: |-
       return id(indoor_dew_point_id).state - id(outdoor_dew_point_id).state;
 
@@ -1478,7 +1521,8 @@ sensor:
   # Absolute Humidity Delta
   # https://esphome.io/components/sensor/template
   #
-  # Same sign convention as the dew point delta above. Diagnostic only --
+  # Same sign convention as the dew point delta above, and driven the same way:
+  # "never" plus a component.update from both source sensors. Diagnostic only --
   # nothing regulates on this, it just makes the moisture transport visible.
   #
   - platform: template
@@ -1488,7 +1532,7 @@ sensor:
     unit_of_measurement: g/m³
     device_class: absolute_humidity
     accuracy_decimals: 1
-    update_interval: 30s
+    update_interval: never
     lambda: |-
       return id(indoor_absolute_humidity_id).state - id(outdoor_absolute_humidity_id).state;
 
@@ -1540,6 +1584,9 @@ sensor:
     temperature: outdoor_temperature_id
     humidity: outdoor_humidity_id
     accuracy_decimals: 1
+    # drives the difference sensor, which polls "never"
+    on_value:
+      - component.update: delta_dew_point_id
 
   #
   # Outdoor Absolute Humidity
@@ -1553,6 +1600,9 @@ sensor:
     temperature: outdoor_temperature_id
     humidity: outdoor_humidity_id
     accuracy_decimals: 1
+    # drives the difference sensor, which polls "never"
+    on_value:
+      - component.update: absolute_humidity_delta_id
 
   #
   # Indoor Temperature
@@ -1589,6 +1639,9 @@ sensor:
     temperature: indoor_temperature_id
     humidity: indoor_humidity_id
     accuracy_decimals: 1
+    # drives the difference sensor, which polls "never"
+    on_value:
+      - component.update: delta_dew_point_id
 
   #
   # Indoor Absolute Humidity
@@ -1602,6 +1655,9 @@ sensor:
     temperature: indoor_temperature_id
     humidity: indoor_humidity_id
     accuracy_decimals: 1
+    # drives the difference sensor, which polls "never"
+    on_value:
+      - component.update: absolute_humidity_delta_id
 
 ################################################################################
 #
@@ -1659,6 +1715,13 @@ switch:
   # device. The lambda reports the real radio state, so the switch stays
   # correct even if WiFi is toggled from somewhere else.
   #
+  # internal: True - an LCD-only control, and not merely as a matter of taste.
+  # Home Assistant reaches this device THROUGH the radio this switch turns off,
+  # so a remote "off" is a one-way trip: the entity that would switch it back on
+  # disappears with the connection that carried the command, and someone has to
+  # walk to the cellar. A control whose remote use can only ever strand the
+  # device does not belong on a remote surface.
+  #
   # restore_mode: DISABLED - the one mode that makes setup() do nothing at all.
   # It has to be spelled out because the schema default is ALWAYS_OFF, and a
   # template switch does not merely publish its restored state, it acts on it:
@@ -1686,7 +1749,7 @@ switch:
     id: wifi_state_id
     name: "WiFi"
     icon: "mdi:wifi"
-    internal: False
+    internal: True
     optimistic: True
     restore_mode: DISABLED
     lambda: |-
@@ -1706,11 +1769,19 @@ switch:
   # MQTT
   # https://esphome.io/components/switch/template
   #
-  # Lets the user take mqtt down from the LCD menu without reflashing.
+  # Lets the user bring mqtt up or down from the LCD menu without reflashing.
   # Deliberately NOT mirroring the real state with a lambda the way the WiFi
   # switch does: the only getter available is is_connected(), so the switch
   # would snap back to off whenever the broker is briefly unreachable and look
-  # broken.
+  # broken. The status bar makes the distinction instead - hollow disc for
+  # enabled but not connected, filled for connected.
+  #
+  # internal: True for the same reason as the WiFi switch: switching mqtt off
+  # over mqtt removes the entity that would switch it back on. Home Assistant
+  # can still reach the device over the api in that case, but the control it
+  # would need is exactly the one that just vanished from its registry. It also
+  # simply has no job there - mqtt off at boot is the intended default, and
+  # turning it on is something you do standing at the device.
   #
   # ALWAYS_OFF has to track "enable_on_boot: False" in the mqtt block, and the
   # coupling is not cosmetic: TemplateSwitch::setup() acts on the restored state
@@ -1723,7 +1794,7 @@ switch:
     id: mqtt_state_id
     name: "MQTT"
     icon: "mdi:transit-connection-variant"
-    internal: False
+    internal: True
     optimistic: True
     restore_mode: ALWAYS_OFF
     turn_on_action:

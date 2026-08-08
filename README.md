@@ -422,6 +422,13 @@ inference from reset timings. Watch it whenever MQTT is switched on. The two hea
 sensors come along nearly free and would catch the other classic cause of late
 resets, a slow leak or a fragmenting heap.
 
+> `Loop Time` is a **maximum, not a sample**. `DebugComponent::loop()` keeps a
+> running maximum and `update()` publishes it and resets it to zero, so each
+> reading is the worst single iteration since the previous one. The debug
+> component's 300 s interval therefore never misses a spike — it only coarsens
+> *when* the spike happened. Shorten the interval temporarily if a value has to
+> be tied to a specific event.
+
 Runtime and cycle count survive a restart. A power cut loses whatever run was in
 progress, because the preference is only written periodically. A factory reset
 clears all of them, including the reset count.
@@ -431,10 +438,31 @@ clears all of them, including the reset count.
 - Binary sensor: `Fan` (read-only mirror of the relay)
 - Select: `Mode` — Automatic / On / Off
 - Numbers: the four control settings above
-- Switches: `WiFi`, `MQTT`
-- Buttons: `Restart`, `Restart (Safe Mode)`, `Factory Reset`
+- Switches: none — see below
+- Buttons: `Restart`, `Restart (Safe Mode)`
 - Text sensors: `ESPHome Version`, `Firmware Version`, `Device Uptime`,
   `Reset Reason`, `SSID`, `IP Address`, `DNS Address`
+
+### Deliberately not exposed
+
+Three entities are declared `internal: True`. That keeps them off Home
+Assistant, off MQTT and — because `web_server` defaults to
+`include_internal: false` — off the web UI, while leaving them fully usable from
+the LCD menu: `internal` only governs frontend exposure, so the menu's
+`switch:` and `button.press:` references still resolve.
+
+| Entity | Why it is local-only |
+|--------|----------------------|
+| `WiFi` switch | Home Assistant reaches the device *through* the radio this switch turns off. A remote "off" is a one-way trip: the entity that would switch it back on disappears with the connection that carried the command. |
+| `MQTT` switch | Same shape — switching MQTT off over MQTT removes the control needed to switch it back on. It also has no job there: off at boot is the intended default, and turning it on is something you do at the device. |
+| `Factory Reset` button | Wipes every preference: the setpoints, the fan runtime and cycle counters, and the reset count. One un-confirmed click, so it should require standing at the device. |
+
+`Restart` and `Restart (Safe Mode)` stay exposed — neither is destructive and
+neither can strand the device.
+
+The MQTT switch being invisible does not make its state invisible: the status bar
+shows blank for disabled, a hollow disc for enabled but not connected, and a
+filled disc once the broker answers.
 
 The relay itself is **internal on purpose**. `control_script` owns it, and a
 second writer from Home Assistant would simply be overridden on the next
@@ -447,9 +475,10 @@ interval tick. To control the fan from outside, set `Mode` instead.
 ### MQTT is disabled at boot
 
 `enable_on_boot: False` is set for MQTT, and the switch uses
-`restore_mode: ALWAYS_OFF`. MQTT must be switched on explicitly, either from the
-LCD menu (*System → MQTT*) or via Home Assistant. Everything needed to regulate
-works without it, so the device comes up in the cheapest possible state.
+`restore_mode: ALWAYS_OFF`. MQTT must be switched on explicitly from the LCD menu
+(*System → MQTT*) — the switch is not exposed remotely, see
+[Deliberately not exposed](#deliberately-not-exposed). Everything needed to
+regulate works without it, so the device comes up in the cheapest possible state.
 
 > ⚠️ **Those two settings must be changed together.** `TemplateSwitch::setup()`
 > does not merely publish the restored state, it *acts* on it — calling
@@ -534,6 +563,29 @@ produced this table, and none of these rows had it available.
 > (`dew-point-ventilation-ec64c98652d0`), which does not collide by accident.
 > The `mqtt_client.h` comment claiming truncation to 23 characters is stale —
 > the buffer is `MAX_NAME_WITH_SUFFIX_SIZE = 128`.
+
+### Web UI
+
+A `web_server` (version 3, `local: True`) runs on port 80 and is protected with
+digest authentication from `web_username` / `web_password`:
+
+```yaml
+web_server:
+  auth:
+    type: digest
+    username: !secret web_username
+    password: !secret web_password
+```
+
+Every other way into this device is authenticated — the API has an encryption
+key, OTA a password, MQTT credentials, the fallback AP a password — and the web
+UI was the one exception. It is not a read-only view: it can switch the fan,
+rewrite every setpoint and restart the device.
+
+`type: digest` is stated explicitly rather than left to the default. ESPHome
+still defaults to `basic`, which puts the password on the wire in an easily
+reversible form, and warns at validation time that the default changes to
+`digest` in 2027.1.0. Naming it is both safer now and immune to that change.
 
 ### Home Assistant API
 
@@ -627,7 +679,7 @@ the container build before it is flashed.
 
 A `secrets.yaml` is required with: `wifi_ssid`, `wifi_password`,
 `wifi_ap_password`, `api_encryption_key`, `ota_password`, `mqtt_broker`,
-`mqtt_username`, `mqtt_password`.
+`mqtt_username`, `mqtt_password`, `web_username`, `web_password`.
 
 ### Logging
 
