@@ -111,6 +111,26 @@ esphome:
         - lambda: |-
             id(reset_count_id) += 1;
 
+    # Negative priority runs after every component is set up, which is what the
+    # pushes below need - component.update() on a not-yet-set-up entity is not
+    # something to rely on.
+    #
+    # These four no longer poll. Each one changes only at a specific moment
+    # (once per boot, on a relay close, never at all), so a timer could only
+    # ever republish an unchanged value - publish_state does not deduplicate.
+    # Without a push here they would simply have no state until that moment
+    # arrives, which in Home Assistant looks like a broken entity.
+    - priority: -100
+      then:
+        # sets fan_reason_id and publishes the text with it, and makes the first
+        # regulating decision now rather than at the first interval tick 10s in.
+        # Expect "Sensor fault" until the first sht3xd reading lands at ~30s -
+        # that is accurate, there genuinely is nothing to regulate on yet.
+        - script.execute: control_script
+        - component.update: firmware_version_id
+        - component.update: reset_count_sensor_id
+        - component.update: fan_cycles_sensor_id
+
   # priority 700 runs early enough that the relais is still controllable
   on_shutdown:
     priority: 700
@@ -523,12 +543,49 @@ script:
   # Single source of truth for the relais state. Called periodically by the
   # interval below and whenever the mode is changed.
   #
+  # It evaluates sensor plausibility itself rather than trusting a caller to
+  # have done it first. That used to be the interval's job, which was fine while
+  # the interval was the only caller - but mode_id's on_value also runs this
+  # script, and on that path the flags were up to 10s stale.
+  #
   - id: control_script
     mode: restart
     then:
       - lambda: |-
+          // ---- sensor plausibility, refreshed on every run ----
+          //
+          // isnan() alone is not enough: a humidity element can die while still
+          // answering with a valid checksum, reporting a frozen value. This
+          // device ran with a constant 1.0% at plausible temperatures, which the
+          // old check waved through - the resulting dew point of -32 C would
+          // have kept the fan off forever without ever raising the error icon.
+          // The datasheet range (0..100%) cannot catch that; only a bound that
+          // comes from the room can.
+          // The isnan() half only works because the sht3xd sensors carry a
+          // "timeout" filter - see the sensor section for why.
+          const float indoor_h = id(indoor_humidity_id).state;
+          const float indoor_t = id(indoor_temperature_id).state;
+          id(indoor_sensor_error_id) = isnan(indoor_h) || isnan(indoor_t) ||
+                                       indoor_h < 5.0f ||
+                                       // NOTE: a damp cellar genuinely reaches
+                                       // 95..100% RH - exactly the situation
+                                       // this device exists for. Raise or drop
+                                       // this bound if it ever faults a correct
+                                       // reading.
+                                       indoor_h > 99.5f;
+
+          // Outdoor deliberately gets the lower bound only: outdoor air really
+          // does sit at 100% RH in fog or rain, so an upper bound would fault
+          // the sensor precisely when it is right.
+          const float outdoor_h = id(outdoor_humidity_id).state;
+          const float outdoor_t = id(outdoor_temperature_id).state;
+          id(outdoor_sensor_error_id) = isnan(outdoor_h) || isnan(outdoor_t) ||
+                                        outdoor_h < 5.0f;
+
+          // ---- decide ----
+          //
           // Every path sets fan_reason_id before it acts, so the reason a user
-          // sees on page 3 and in Home Assistant always matches what the relay
+          // sees on page 0 and in Home Assistant always matches what the relay
           // is doing. The paths that return early are exactly the ones that
           // used to be invisible from outside - Fan=OFF looked identical for a
           // manual stop, a cold night, a broken sensor and a small difference.
@@ -594,6 +651,13 @@ script:
           else {
             id(fan_reason_id) = running ? 0 : 1;
           }
+      # Publish the reason the moment it is decided, instead of letting the text
+      # sensor poll for it on a timer of its own. Both ran at 10s before, but on
+      # independent clocks, so the entity explaining the fan state could lag the
+      # decision it describes by up to a full interval.
+      # This runs on every path above: the early "return"s leave the lambda, not
+      # the script, so the action list continues either way.
+      - component.update: fan_reason_text_id
 
   #
   # Load the RTC into the datetime helper numbers
@@ -709,36 +773,13 @@ script:
 interval:
   # Three times the 30s sensor interval: fast enough for the error icon on the
   # display, cheap enough to not run on every main loop pass
+  # The plausibility check used to live here, immediately before the script.
+  # It now runs inside control_script instead, because this interval was not the
+  # only caller: mode_id's on_value fires the script too, and on that path the
+  # error flags could be up to a full interval old. Regulating on stale fault
+  # state is exactly what the check exists to prevent.
   - interval: 10s
     then:
-      - lambda: |-
-          // isnan() alone is not enough: a humidity element can die while still
-          // answering with a valid checksum, reporting a frozen value. This
-          // device ran with a constant 1.0% at plausible temperatures, which the
-          // old check waved through - the resulting dew point of -32 C would
-          // have kept the fan off forever without ever raising the error icon.
-          // The datasheet range (0..100%) cannot catch that; only a bound that
-          // comes from the room can.
-          // The isnan() half of the check only works because the sht3xd sensors
-          // carry a "timeout" filter - see the sensor section for why.
-          const float indoor_h = id(indoor_humidity_id).state;
-          const float indoor_t = id(indoor_temperature_id).state;
-          id(indoor_sensor_error_id) = isnan(indoor_h) || isnan(indoor_t) ||
-                                       indoor_h < 5.0f ||
-                                       // NOTE: a damp cellar genuinely reaches
-                                       // 95..100% RH - exactly the situation
-                                       // this device exists for. Raise or drop
-                                       // this bound if it ever faults a correct
-                                       // reading.
-                                       indoor_h > 99.5f;
-
-          // Outdoor deliberately gets the lower bound only: outdoor air really
-          // does sit at 100% RH in fog or rain, so an upper bound would fault
-          // the sensor precisely when it is right.
-          const float outdoor_h = id(outdoor_humidity_id).state;
-          const float outdoor_t = id(outdoor_temperature_id).state;
-          id(outdoor_sensor_error_id) = isnan(outdoor_h) || isnan(outdoor_t) ||
-                                        outdoor_h < 5.0f;
       - script.execute: control_script
 
 ################################################################################
@@ -961,7 +1002,8 @@ text_sensor:
     name: Fan State Reason
     icon: mdi:information-outline
     entity_category: diagnostic
-    update_interval: 10s
+    # pushed by control_script the moment the reason is set, not polled
+    update_interval: never
     lambda: |-
       switch (id(fan_reason_id)) {
         case 0: return {"Ventilating"};
@@ -988,9 +1030,14 @@ text_sensor:
   # Firmware Version
   #
   - platform: template
+    id: firmware_version_id
     name: Firmware Version
     icon: mdi:new-box
-    update_interval: 60s
+    # A compile-time constant. Polling it re-sent the same string to the api and
+    # mqtt every 60s for the lifetime of the device; publish_state does not
+    # deduplicate, so nothing upstream was filtering that out. Published once
+    # from the late on_boot block instead.
+    update_interval: never
     lambda: |-
       return {"$version"};
 
@@ -1434,7 +1481,8 @@ sensor:
     state_class: total_increasing
     accuracy_decimals: 0
     entity_category: diagnostic
-    update_interval: 60s
+    # only ever changes when the relay closes, so it is pushed from there
+    update_interval: never
     lambda: |-
       return id(fan_cycles_id);
 
@@ -1486,7 +1534,8 @@ sensor:
     state_class: total_increasing
     accuracy_decimals: 0
     entity_category: diagnostic
-    update_interval: 60s
+    # incremented exactly once per boot, so a poll can only ever repeat itself
+    update_interval: never
     lambda: |-
       return id(reset_count_id);
 
@@ -1698,6 +1747,8 @@ switch:
             id(fan_on_since_ms_id) = millis();
             id(fan_last_change_ms_id) = millis();
             id(fan_cycles_id) += 1;
+        # the counter's only source of change, so it publishes from here
+        - component.update: fan_cycles_sensor_id
     on_turn_off:
       then:
         - lambda: |-

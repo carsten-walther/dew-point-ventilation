@@ -64,13 +64,21 @@ outside (0, 100] — it never substitutes a value.
 
 ### Control algorithm
 
-Evaluated every 10 s, in this order — each step can abort the ones below it:
+Evaluated every 10 s — and additionally the moment *Mode* changes, so a manual
+override takes effect at once instead of on the next tick. In this order, each
+step able to abort the ones below it:
 
 1. **Mode override.** `On` forces the fan on, `Off` forces it off. Only
    `Automatic` continues to the checks below.
 2. **Sensor plausibility.** If either sensor reads implausibly (see
    [Safety behaviour](#safety-behaviour)), the fan is switched off and control
    stops. Regulating on bad data is worse than not regulating.
+
+   The check is re-evaluated at the top of every run rather than by the caller.
+   It used to sit in the 10 s interval, which was correct only as long as that
+   interval was the sole caller — on the *Mode* path the fault flags could be a
+   full interval stale, which is precisely the state this check exists to
+   refuse to act on.
 3. **Temperature limits.** If the indoor temperature is below *Indoor temperature
    minimum*, or the outdoor temperature below *Outdoor temperature minimum*, the
    fan is switched off. This keeps the room from being cooled down and protects
@@ -608,8 +616,9 @@ The fan is switched off:
 - before a firmware update (`on_update`), so the fan is never left energised
   across a flash,
 - on an OTA error,
-- at boot, since the relay has no `restore_mode` and must start from a defined
-  state,
+- at boot — belt and braces. No `restore_mode` is configured on the relay, so it
+  takes the schema default `ALWAYS_OFF` and lands off on its own; the explicit
+  `switch.turn_off` states the intent rather than inheriting it silently,
 - whenever a sensor reads implausibly.
 
 ### Sensor plausibility
@@ -723,6 +732,31 @@ keeps busy. (The original reason was the DHT driver's interrupt-locked read; tha
 cost is gone with the SHT31s, but the interval is still right.) A cellar is
 thermally slow; 30 s is still far finer than anything the room does. The visible
 cost is that breathing on a sensor takes up to 30 s to register.
+
+**Not everything polls.** Several entities are declared `update_interval: never`
+and pushed from wherever their value actually changes, because
+`publish_state()` does not deduplicate — a timer on an unchanging value simply
+re-sends it to the API and MQTT forever.
+
+| Entity | Pushed from |
+|--------|-------------|
+| `Fan State Reason` | the end of `control_script` |
+| `Fan Switch Cycles` | the relay's `on_turn_on` |
+| `Reset Count`, `Firmware Version` | the late `on_boot` block |
+| `Delta Dew Point`, `Absolute Humidity Delta` | `on_value` of their two source sensors each |
+
+For `Fan State Reason` the point is latency, not traffic: it and
+`control_script` both ran at 10 s but on independent clocks, so the entity
+explaining the fan state could lag the decision it described by a full interval.
+`Fan Runtime` deliberately keeps polling — it genuinely creeps upward while the
+fan runs.
+
+An `on_boot` block at priority **−100** publishes the push-only entities once at
+startup; without it they would have no state until their trigger first fires,
+which in Home Assistant looks like a broken entity. That block also runs
+`control_script` once, so the first regulating decision happens immediately
+rather than at the first interval tick. Expect `Sensor fault` for the first ~30 s
+after a boot — accurate, since no SHT31 reading has arrived yet.
 
 **Setup priority is a real hazard in `on_boot`.** Components at the same priority
 are set up in registration order, so an `on_boot` block races anything declared
