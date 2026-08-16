@@ -1,0 +1,9 @@
+# WiFi, API and OTA credentials - never commit
+secrets.yaml
+
+# ESPHome build tree, downloaded fonts and icons, compiled firmware
+.esphome/
+*.bin
+
+# macOS
+.DS_Store
