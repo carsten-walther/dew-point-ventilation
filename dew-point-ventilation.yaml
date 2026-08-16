@@ -1,10 +1,8 @@
-################################################################################
-#
-# Project Settings
-#
-################################################################################
+# ═══════════════════════════════════════════════════════════
+#  Dew Point Ventilation
+#  Home Assistant
+# ═══════════════════════════════════════════════════════════
 
-# Pinout: https://randomnerdtutorials.com/esp32-pinout-reference-gpios/
 # Example Menu: https://www.ambientika.eu/cms/wp-content/uploads/Ambientika-Taupunktsteuerung.pdf
 
 substitutions:
@@ -39,12 +37,6 @@ substitutions:
   MIN_RUN_TIME_S: "300"
   MIN_PAUSE_TIME_S: "180"
 
-################################################################################
-#
-# General Settings
-#
-################################################################################
-
 #
 # https://esphome.io/components/esphome
 #
@@ -53,8 +45,6 @@ esphome:
   friendly_name: "${friendly_name}"
   comment: "${comment}"
   area: "${area}"
-
-  build_path: "../config/esphome/build/${project_name}"
   
   project:
     name: "${author_name}.${project_name}"
@@ -395,12 +385,6 @@ logger:
 #
 debug:
   update_interval: 300s
-
-################################################################################
-#
-# Specific Settings
-#
-################################################################################
 
 #
 # https://esphome.io/components/globals
@@ -782,12 +766,6 @@ interval:
     then:
       - script.execute: control_script
 
-################################################################################
-#
-# Numbers
-#
-################################################################################
-
 #
 # https://esphome.io/components/number
 #
@@ -961,12 +939,6 @@ number:
     internal: True
     step: 1.0
 
-################################################################################
-#
-# Text Sensors
-#
-################################################################################
-
 #
 # https://esphome.io/components/text_sensor
 #
@@ -1101,12 +1073,6 @@ text_sensor:
       name: DNS Address
       icon: mdi:dns-outline
 
-################################################################################
-#
-# Binary Sensors
-#
-################################################################################
-
 #
 # https://esphome.io/components/binary_sensor
 #
@@ -1214,12 +1180,6 @@ binary_sensor:
         - lambda: |-
             id(display_id).no_backlight();
 
-################################################################################
-#
-# Selects
-#
-################################################################################
-
 #
 # https://esphome.io/components/select
 #
@@ -1246,12 +1206,6 @@ select:
     on_value:
       then:
         - script.execute: control_script
-
-################################################################################
-#
-# Buttons
-#
-################################################################################
 
 #
 # https://esphome.io/components/button
@@ -1298,12 +1252,6 @@ button:
     id: safemode_id
     name: Restart (Safe Mode)
     icon: mdi:reload
-
-################################################################################
-#
-# Sensors
-#
-################################################################################
 
 #
 # https://esphome.io/components/sensor/index
@@ -1708,12 +1656,6 @@ sensor:
     on_value:
       - component.update: absolute_humidity_delta_id
 
-################################################################################
-#
-# Switches
-#
-################################################################################
-
 #
 # https://esphome.io/components/switch/index
 #
@@ -1854,12 +1796,6 @@ switch:
     turn_off_action:
       then:
         - mqtt.disable:
-
-################################################################################
-#
-# LCD
-#
-################################################################################
 
 #
 # https://esphome.io/components/display_menu/lcd_menu
