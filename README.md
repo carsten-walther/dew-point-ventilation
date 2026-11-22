@@ -83,7 +83,15 @@ step able to abort the ones below it:
    minimum*, or the outdoor temperature below *Outdoor temperature minimum*, the
    fan is switched off. This keeps the room from being cooled down and protects
    against running the fan in freezing conditions.
-4. **Dew point difference with hysteresis.**
+4. **Humidity target.** The fan only dries while the cellar is actually too
+   humid: it starts only above *Humidity target* + *Humidity hysteresis* and
+   keeps running down to the target itself. Below that the fan stays off with
+   the reason `Dry enough`, even if the outside air is drier. Without this step
+   the fan ran whenever the outdoor dew point allowed it, cooling an already dry
+   cellar and drawing heat from the rooms above for nothing. Unlike the safety
+   limits in step 3 this is an efficiency rule, so it respects the minimum
+   runtime of step 6.
+5. **Dew point difference with hysteresis.**
 
 ```
 delta = dew point indoors − dew point outdoors
@@ -97,7 +105,7 @@ The band between `minimum` and `minimum + hysteresis` is the hysteresis: inside
 it nothing changes, which prevents the relay from chattering when the difference
 hovers around the threshold.
 
-5. **Minimum runtime and pause.** Step 4 may not stop a fan that has been running
+6. **Minimum runtime and pause.** Steps 4 and 5 may not stop a fan that has been running
    for less than `MIN_RUN_TIME_S`, nor start one that has been off for less than
    `MIN_PAUSE_TIME_S`. This protects the motor and the relay contacts from short
    cycling.
@@ -129,6 +137,7 @@ shown on display page 0:
 | `Manual: On` / `Manual: Off` | Mode override active |
 | `Min runtime hold` | Wants to stop, minimum runtime not reached yet |
 | `Min pause hold` | Wants to start, minimum pause not over yet |
+| `Dry enough` | Indoor humidity at or below its target |
 
 Without this, the only outward signal was `Fan: OFF` — identical for a manual
 stop, a cold night, a broken sensor and a difference that is simply too small.
@@ -317,6 +326,8 @@ Mode                          Automatic / On / Off
 Settings
   Dew point diff. min.
   Hysteresis
+  Humidity                    e.g. [ 55%]
+  Hum. hyst.                  e.g. [  3%]
   Indoor min                  e.g. [  8°C]
   Outdoor min                 e.g. [  5°C]
   Back
@@ -359,6 +370,8 @@ update against an invalid clock.
 |---------|-------|------|---------|---------|
 | Minimum dew point difference | 1.0 … 9.0 °C | 0.5 | 5.0 | How much drier outside air must be before ventilating |
 | Hysteresis | 0.0 … 5.0 °C | 0.5 | 1.0 | Dead band above the minimum; prevents relay chatter |
+| Humidity target | 40 … 80 % | 1 | 55 | The fan only dries while the indoor humidity is above this |
+| Humidity hysteresis | 0 … 10 % | 1 | 3 | Start above target + this band, stop at the target |
 | Indoor temperature minimum | 5 … 25 °C | 1 | 8 | Below this the fan stays off so the room is not cooled further |
 | Outdoor temperature minimum | −30 … 20 °C | 1 | 5 | Below this the fan stays off |
 | Backlight delay | 3 … 180 s | 1 | 10 | How long the display stays lit after an interaction |

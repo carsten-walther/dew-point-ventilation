@@ -11,7 +11,7 @@ substitutions:
   author_name: carsten-walther
   friendly_name: Taupunktlüftung
   comment: Taupunktlüftung zur Steuerung von Abluftventilatoren
-  version: 2026.8.8
+  version: 2026.11.22
   area: Keller
 
   #
@@ -429,7 +429,8 @@ globals:
   # stale. Rendered to text by fan_reason_text_id and shown on display page 3.
   # Codes: 0 ventilating, 1 difference too small, 2 indoor too cold,
   #        3 outdoor too cold, 4 sensor fault, 5 manual on, 6 manual off,
-  #        7 held on by MIN_RUN_TIME_S, 8 held off by MIN_PAUSE_TIME_S
+  #        7 held on by MIN_RUN_TIME_S, 8 held off by MIN_PAUSE_TIME_S,
+  #        9 indoor humidity at or below its target
   - id: fan_reason_id
     type: int
     restore_value: no
@@ -607,11 +608,34 @@ script:
             return;
           }
 
-          const float delta = id(indoor_dew_point_id).state - id(outdoor_dew_point_id).state;
-          const float minimum = id(dew_point_difference_min_id).state;
           const bool running = id(relais_id).state;
           // unsigned subtraction, so a millis() rollover is harmless
           const uint32_t since_change = millis() - id(fan_last_change_ms_id);
+
+          // Humidity target: only dry the cellar while it actually is too humid.
+          // Without this gate the fan ran whenever the outside air was drier,
+          // cooling a cellar that was already dry enough and pulling heat from
+          // the rooms above for nothing.
+          // The band works like the dew point hysteresis: start only above
+          // target + band, then keep drying down to the target itself.
+          // Unlike the safety limits this is an efficiency rule, so it respects
+          // the minimum runtime like the dew point logic below.
+          const float rh_target = id(humidity_target_id).state;
+          const float rh_band = id(humidity_hysteresis_id).state;
+          const bool too_humid = running ? indoor_h >= rh_target
+                                         : indoor_h > rh_target + rh_band;
+          if (!too_humid) {
+            if (running && since_change < ${MIN_RUN_TIME_S} * 1000UL) {
+              id(fan_reason_id) = 7;  // wants to stop, minimum runtime not met
+              return;
+            }
+            id(fan_reason_id) = 9;
+            id(relais_id).turn_off();
+            return;
+          }
+
+          const float delta = id(indoor_dew_point_id).state - id(outdoor_dew_point_id).state;
+          const float minimum = id(dew_point_difference_min_id).state;
 
           // dew point outside sufficiently lower than inside -> ventilate
           if (delta > minimum + id(hysteresis_id).state) {
@@ -807,6 +831,40 @@ number:
     step: 0.5
 
   #
+  # Indoor humidity target
+  #
+  # The fan only dries while the indoor humidity is above this value, see the
+  # humidity step in control_script.
+  - platform: template
+    name: Humidity target
+    icon: mdi:water-percent
+    id: humidity_target_id
+    unit_of_measurement: "%"
+    device_class: humidity
+    min_value: 40.0
+    max_value: 80.0
+    initial_value: 55.0
+    restore_value: True
+    optimistic: True
+    step: 1.0
+
+  #
+  # Humidity hysteresis
+  #
+  # Start above target + this band, stop at the target.
+  - platform: template
+    name: Humidity hysteresis
+    icon: mdi:chart-bell-curve-cumulative
+    id: humidity_hysteresis_id
+    unit_of_measurement: "%"
+    min_value: 0.0
+    max_value: 10.0
+    initial_value: 3.0
+    restore_value: True
+    optimistic: True
+    step: 1.0
+
+  #
   # Indoor temperature minimum
   #
   - platform: template
@@ -987,6 +1045,7 @@ text_sensor:
         case 6: return {"Manual: Off"};
         case 7: return {"Min runtime hold"};
         case 8: return {"Min pause hold"};
+        case 9: return {"Dry enough"};
       }
       return {"Unknown"};
 
@@ -1848,6 +1907,22 @@ lcd_menu:
         # label is cut to 10 characters. Hence the shortened texts: the old
         # 'Out. temp. min.' was already being clipped to 'Out. temp. m' by the
         # bare '%.0f' value, only less obviously.
+        - type: number
+          text: 'Humidity'
+          immediate_edit: False
+          number: humidity_target_id
+          value_lambda: |-
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%.0f%%", id(humidity_target_id).state);
+            return std::string(buf);
+        - type: number
+          text: 'Hum. hyst.'
+          immediate_edit: False
+          number: humidity_hysteresis_id
+          value_lambda: |-
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%.0f%%", id(humidity_hysteresis_id).state);
+            return std::string(buf);
         - type: number
           text: 'Indoor min'
           immediate_edit: False
