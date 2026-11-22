@@ -699,7 +699,8 @@ esphome logs dew-point-ventilation.yaml --device <ip-address>
 lambdas — those only surface in a real compile. Anything touching a lambda needs
 the container build before it is flashed.
 
-A `secrets.yaml` is required with: `wifi_ssid`, `wifi_password`,
+A `secrets.yaml` is required with: `wifi_ssid_1`, `wifi_password_1`,
+`wifi_ssid_2`, `wifi_password_2` (the device tries both networks),
 `wifi_ap_password`, `api_encryption_key`, `ota_password`, `mqtt_broker`,
 `mqtt_username`, `mqtt_password`, `web_username`, `web_password`.
 
